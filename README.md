@@ -18,6 +18,9 @@ um das Fenster in einen anderen Workspace zu schieben. Optional zeigt jede
 Zeile die Bundle-ID zum Kopieren — praktisch, wenn man gerade eine
 `on-window-detected`-Regel schreibt und nicht raten will.
 
+Über der Liste erscheint eine Warnung, wenn **AeroSpace ein sichtbares
+Fenster nicht kennt** — siehe unten.
+
 **Workspaces** — Übersicht mit Monitor und Fensterzahl, Klick springt hin,
 `flatten` + `balance-sizes` pro Workspace.
 
@@ -69,6 +72,28 @@ alle `.sh`-Dateien mit ihrem Dateinamen gelistet.
 
 Eine passende Skriptsammlung liegt in
 [agenticapps-eu/aerospace-setup](https://github.com/agenticapps-eu/aerospace-setup).
+
+## Verlorene Fenster erkennen
+
+AeroSpace verliert gelegentlich ein Fenster aus seiner Verwaltung. Das sieht
+nicht nach einem Fehler aus, und genau das macht es lästig: das Fenster
+bleibt liegen, wo es zuletzt war, und weil AeroSpace fremde Workspaces durch
+Wegschieben ausblendet, wandert ein Fenster, das es nicht kennt, eben nie
+weg — es klebt über allem. Der Nachbar in derselben Spalte zieht sich
+derweil auf die volle Höhe, weil er plötzlich allein im Container steht.
+
+AeroPilot vergleicht deshalb zwei Quellen: die Fensterliste von macOS
+(`CGWindowListCopyWindowInfo`) gegen die von AeroSpace, abgeglichen über die
+Prozess-ID. Was nur macOS kennt, erscheint als Warnung mit einem Knopf zum
+Neustarten der App — die einzige verlässliche Art, AeroSpace ein Fenster
+zurückzugeben, denn es gibt kein Kommando, das die Fenstererfassung neu
+anstösst.
+
+Die Filter sind bewusst streng, lieber eine Meldung zu wenig als eine
+falsche: nur Fensterebene 0 (schliesst Overlays wie Raycast oder Alfred
+aus), nur sichtbare Fenster (Vollbild und andere macOS-Spaces verwaltet
+AeroSpace ohnehin nie), mindestens 300 × 200 px, und nur Apps mit Dock-Icon.
+Einzelne Apps lassen sich dauerhaft ignorieren.
 
 ## Autostart
 

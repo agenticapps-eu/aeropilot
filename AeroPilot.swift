@@ -18,6 +18,7 @@
 
 import SwiftUI
 import ServiceManagement
+import CoreGraphics
 
 // ── Einstellungen ─────────────────────────────────────────────────────
 // Schlüssel an einer Stelle, damit Views und Model sich nicht widersprechen.
@@ -32,6 +33,8 @@ enum Pref {
     static let panelHeight     = "panelHeight"
     static let notify          = "notifyOnAction"
     static let keepBackups     = "keepBackups"
+    static let checkOrphans    = "checkOrphans"
+    static let ignoredApps     = "ignoredApps"
 
     /// Erstwerte. UserDefaults liefert für unbekannte Schlüssel 0/false —
     /// deshalb müssen sinnvolle Vorgaben registriert werden, sonst startet
@@ -45,6 +48,8 @@ enum Pref {
             panelHeight: 380.0,
             notify: false,
             keepBackups: 10,
+            checkOrphans: true,
+            ignoredApps: [String](),
         ])
     }
 }
@@ -195,6 +200,7 @@ struct Win: Identifiable, Decodable {
     let appBundleId: String
     let windowTitle: String
     let monitorName: String
+    let appPid: Int
 
     var id: Int { windowId }
     var isFloating: Bool { windowLayout == "floating" }
@@ -207,7 +213,30 @@ struct Win: Identifiable, Decodable {
         case appBundleId = "app-bundle-id"
         case windowTitle = "window-title"
         case monitorName = "monitor-name"
+        case appPid = "app-pid"
     }
+}
+
+/// Eine App, die sichtbare Fenster auf dem Bildschirm hat, von denen
+/// AeroSpace keines kennt.
+///
+/// WOZU: AeroSpace verliert gelegentlich ein Fenster — beobachtet am
+/// 20.08.2026 bei Readwise Reader. Die Folge ist tückisch, weil sie nicht
+/// nach einem Fehler aussieht: das Fenster bleibt liegen, wo es zuletzt
+/// war, und weil AeroSpace fremde Workspaces durch Wegschieben ausblendet,
+/// wandert ein Fenster, das es nicht kennt, eben nie weg. Es klebt über
+/// allem. Gleichzeitig zieht sich der verbliebene Nachbar auf die volle
+/// Spaltenbreite, weil er allein im Container steht.
+///
+/// Erkannt wird das durch Abgleich zweier Quellen: die Fensterliste von
+/// macOS selbst (CoreGraphics) gegen die von AeroSpace, verglichen über
+/// die Prozess-ID.
+struct Orphan: Identifiable {
+    let pid: pid_t
+    let name: String
+    let count: Int
+    let bundleURL: URL?
+    var id: pid_t { pid }
 }
 
 /// Ein Skript aus dem env-Verzeichnis, das sich per Kopfzeile angemeldet hat.
@@ -240,13 +269,14 @@ final class Model: ObservableObject {
     @Published var status: String = ""
     @Published var statusIsError = false
     @Published var scripts: [Script] = []
+    @Published var orphans: [Orphan] = []
 
     let configPath = NSHomeDirectory() + "/.config/aerospace/aerospace.toml"
     let envDir     = NSHomeDirectory() + "/.config/aerospace/env"
 
     func refresh() {
         let fields = "%{window-id}%{workspace}%{window-layout}%{app-name}" +
-                     "%{app-bundle-id}%{window-title}%{monitor-name}"
+                     "%{app-bundle-id}%{window-title}%{monitor-name}%{app-pid}"
         let w = Aero.run(["list-windows", "--monitor", "all", "--json", "--format", fields])
         windows = (try? JSONDecoder().decode([Win].self,
                     from: Data(w.out.utf8)))?.sorted {
@@ -265,6 +295,89 @@ final class Model: ObservableObject {
                 .split(separator: "\n").first.map(String.init) ?? "?"
         }
         loadScripts()
+        findOrphans()
+    }
+
+    // ── Unverwaltete Fenster ──────────────────────────────────────────
+
+    /// Vergleicht die Fensterliste von macOS mit der von AeroSpace.
+    ///
+    /// Die Filter sind da, um Fehlalarme zu vermeiden, nicht um vollständig
+    /// zu sein — lieber eine Meldung zu wenig als eine falsche:
+    ///   • nur Ebene 0: schliesst Menüleisten-Overlays, Tooltips und
+    ///     Schnellstarter wie Raycast oder Alfred aus, die über allem liegen
+    ///   • nur sichtbare Fenster: Fenster auf anderen macOS-Spaces und in
+    ///     nativem Vollbild zählen nicht, die verwaltet AeroSpace ohnehin nie
+    ///   • Mindestgrösse: Schatten, Hilfsfenster und Fortschrittsbalken raus
+    ///   • eigene PID raus: das Popover dieser App ist selbst ein Fenster
+    func findOrphans() {
+        guard UserDefaults.standard.bool(forKey: Pref.checkOrphans) else {
+            orphans = []; return
+        }
+        let ignored = Set(UserDefaults.standard.stringArray(forKey: Pref.ignoredApps) ?? [])
+        let known = Set(windows.map { pid_t($0.appPid) })
+        let mine = ProcessInfo.processInfo.processIdentifier
+
+        let info = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+            as? [[String: Any]] ?? []
+
+        var counts: [pid_t: Int] = [:]
+        for w in info {
+            guard (w[kCGWindowLayer as String] as? Int) == 0,
+                  let pid = w[kCGWindowOwnerPID as String] as? pid_t,
+                  pid != mine, !known.contains(pid),
+                  let b = w[kCGWindowBounds as String] as? [String: Any],
+                  let width = b["Width"] as? Double, let height = b["Height"] as? Double,
+                  width >= 300, height >= 200
+            else { continue }
+            counts[pid, default: 0] += 1
+        }
+
+        orphans = counts.compactMap { pid, n in
+            guard let app = NSRunningApplication(processIdentifier: pid),
+                  let name = app.localizedName,
+                  !ignored.contains(name),
+                  app.activationPolicy == .regular   // Hintergrunddienste raus
+            else { return nil }
+            return Orphan(pid: pid, name: name, count: n, bundleURL: app.bundleURL)
+        }
+        .sorted { $0.name < $1.name }
+    }
+
+    func ignore(_ o: Orphan) {
+        var list = UserDefaults.standard.stringArray(forKey: Pref.ignoredApps) ?? []
+        if !list.contains(o.name) { list.append(o.name) }
+        UserDefaults.standard.set(list, forKey: Pref.ignoredApps)
+        say("\(o.name) wird nicht mehr gemeldet.")
+        findOrphans()
+    }
+
+    /// Beenden und neu öffnen. Das ist die einzige verlässliche Art, AeroSpace
+    /// ein verlorenes Fenster zurückzugeben: es gibt kein Kommando, das die
+    /// Fenstererfassung neu anstösst — nur ein neu erscheinendes Fenster wird
+    /// erfasst.
+    func restart(_ o: Orphan) {
+        guard let app = NSRunningApplication(processIdentifier: o.pid),
+              let url = o.bundleURL else {
+            say("Kein App-Bundle zu \(o.name) gefunden.", error: true); return
+        }
+        say("\(o.name) wird neu gestartet …")
+        app.terminate()
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            if !app.isTerminated {
+                app.forceTerminate()
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            }
+            let cfg = NSWorkspace.OpenConfiguration()
+            _ = try? await NSWorkspace.shared.openApplication(at: url, configuration: cfg)
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            self.refresh()
+            self.say(self.orphans.contains { $0.name == o.name }
+                     ? "\(o.name) neu gestartet, wird aber weiterhin nicht verwaltet."
+                     : "\(o.name) neu gestartet und wieder verwaltet. Layout ggf. richten.")
+        }
     }
 
     func say(_ text: String, error: Bool = false) {
@@ -488,6 +601,7 @@ struct WindowsView: View {
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 2) {
+                if !m.orphans.isEmpty { OrphanBanner(m: m) }
                 ForEach(grouped, id: \.0) { ws, wins in
                     HStack(spacing: 6) {
                         Text("Workspace \(ws)").font(.caption).bold()
@@ -508,6 +622,44 @@ struct WindowsView: View {
             }
             .padding(.bottom, 8)
         }
+    }
+}
+
+/// Warnung über der Fensterliste. Bewusst kein Dialog: sie soll auffallen,
+/// wenn man ohnehin hinschaut, und nicht die Arbeit unterbrechen.
+struct OrphanBanner: View {
+    @ObservedObject var m: Model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text("AeroSpace verwaltet diese Fenster nicht")
+                    .font(.system(size: 12, weight: .semibold))
+            }
+            Text("Sie bleiben beim Workspace-Wechsel liegen und überlagern alles. "
+                 + "Ein Neustart der App gibt AeroSpace das Fenster zurück.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            ForEach(m.orphans) { o in
+                HStack(spacing: 8) {
+                    Text(o.name).font(.system(size: 12, weight: .medium))
+                    Text(o.count == 1 ? "1 Fenster" : "\(o.count) Fenster")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("neu starten") { m.restart(o) }
+                        .buttonStyle(.borderedProminent).controlSize(.small)
+                    Button("ignorieren") { m.ignore(o) }
+                        .buttonStyle(.link).font(.caption)
+                }
+            }
+        }
+        .padding(10)
+        .background(Color.orange.opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .padding(.horizontal, 10).padding(.top, 8)
     }
 }
 
@@ -692,6 +844,11 @@ struct SettingsView: View {
     @AppStorage(Pref.panelHeight)   private var panelHeight = 380.0
     @AppStorage(Pref.notify)        private var notify = false
     @AppStorage(Pref.keepBackups)   private var keepBackups = 10
+    @AppStorage(Pref.checkOrphans)  private var checkOrphans = true
+
+    /// @AppStorage kann kein [String] — deshalb beim Öffnen aus den
+    /// UserDefaults nachladen.
+    @State private var ignoredApps: [String] = []
 
     /// Autostart lebt nicht in UserDefaults, sondern im System. Deshalb bei
     /// jedem Öffnen frisch abfragen statt einen Schalterzustand zu speichern —
@@ -745,6 +902,28 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
+                group("Unverwaltete Fenster") {
+                    Toggle("Melden, wenn AeroSpace ein sichtbares Fenster nicht kennt",
+                           isOn: $checkOrphans)
+                    Text("Verglichen wird die Fensterliste von macOS mit der von "
+                         + "AeroSpace. Gemeldet wird nur, was sichtbar, gross genug "
+                         + "und auf der normalen Fensterebene liegt.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if !ignoredApps.isEmpty {
+                        HStack(spacing: 8) {
+                            Text("ignoriert: " + ignoredApps.joined(separator: ", "))
+                                .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                            Button("zurücksetzen") {
+                                UserDefaults.standard.set([String](), forKey: Pref.ignoredApps)
+                                ignoredApps = []
+                                m.findOrphans()
+                            }
+                            .buttonStyle(.link).font(.caption)
+                        }
+                    }
+                }
+
                 group("Config-Backups") {
                     HStack {
                         Text("Sicherungen behalten").font(.system(size: 12))
@@ -775,7 +954,10 @@ struct SettingsView: View {
             }
             .padding(12)
         }
-        .onAppear { mode = Autostart.mode }
+        .onAppear {
+            mode = Autostart.mode
+            ignoredApps = UserDefaults.standard.stringArray(forKey: Pref.ignoredApps) ?? []
+        }
     }
 
     var modeText: String {
@@ -816,8 +998,16 @@ struct StatusBar: View {
                     .foregroundStyle(m.statusIsError ? .red : .secondary)
                     .lineLimit(4).textSelection(.enabled)
             } else {
-                Text("\(m.windows.count) Fenster · \(m.workspaces.count) Workspaces")
-                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                HStack(spacing: 6) {
+                    Text("\(m.windows.count) Fenster · \(m.workspaces.count) Workspaces")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                    // Auch sichtbar, wenn man gerade in einem anderen Bereich ist
+                    if !m.orphans.isEmpty {
+                        Label("\(m.orphans.count) unverwaltet",
+                              systemImage: "exclamationmark.triangle.fill")
+                            .font(.system(size: 10)).foregroundStyle(.orange)
+                    }
+                }
             }
             Spacer()
             Button { m.refresh(); m.say("") } label: {
