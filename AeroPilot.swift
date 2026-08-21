@@ -36,6 +36,8 @@ enum Pref {
     static let checkOrphans    = "checkOrphans"
     static let ignoredApps     = "ignoredApps"
     static let checkMisplaced  = "checkMisplaced"
+    static let relayoutAfterRestart = "relayoutAfterRestart"
+    static let watch           = "watchInBackground"
 
     /// Erstwerte. UserDefaults liefert für unbekannte Schlüssel 0/false —
     /// deshalb müssen sinnvolle Vorgaben registriert werden, sonst startet
@@ -52,6 +54,8 @@ enum Pref {
             checkOrphans: true,
             ignoredApps: [String](),
             checkMisplaced: true,
+            relayoutAfterRestart: true,
+            watch: true,
         ])
     }
 }
@@ -291,6 +295,13 @@ struct Ws: Identifiable, Decodable {
 
 @MainActor
 final class Model: ObservableObject {
+    /// Ein einziges Model, früh erzeugt. Nicht aus Bequemlichkeit: mit
+    /// `.menuBarExtraStyle(.window)` baut SwiftUI die Ansicht erst beim
+    /// ersten Öffnen des Popovers. Läge das Model dort als @StateObject,
+    /// liefe die Hintergrundprüfung erst, nachdem man einmal hingeschaut
+    /// hat — also genau dann nicht, wenn sie gebraucht wird.
+    static let shared = Model()
+
     @Published var windows: [Win] = []
     @Published var workspaces: [Ws] = []
     @Published var focused: String = ""
@@ -303,6 +314,38 @@ final class Model: ObservableObject {
 
     let configPath = NSHomeDirectory() + "/.config/aerospace/aerospace.toml"
     let envDir     = NSHomeDirectory() + "/.config/aerospace/env"
+
+    // ── Hintergrundprüfung ────────────────────────────────────────────
+    // Ein verlorenes Fenster meldet sich nicht. Man merkt es erst, wenn
+    // es beim Workspace-Wechsel liegenbleibt — oft Stunden später. Also
+    // regelmässig nachsehen und einmal Bescheid geben.
+    private var watchTimer: Timer?
+    private var announced: Set<pid_t> = []
+
+    func startWatch() {
+        watchTimer?.invalidate(); watchTimer = nil
+        guard UserDefaults.standard.bool(forKey: Pref.watch) else { return }
+        // 60 s ist ein Kompromiss: die Prüfung kostet ein paar CLI-Aufrufe,
+        // und schneller als „innerhalb einer Minute" muss die Meldung nicht
+        // sein — der Schaden entsteht erst beim nächsten Workspace-Wechsel.
+        watchTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
+            Task { @MainActor in Model.shared.watchTick() }
+        }
+        refresh()
+        announced = Set(orphans.map(\.pid))   // beim Start nicht nachträglich meckern
+    }
+
+    private func watchTick() {
+        refresh()
+        let now = Set(orphans.map(\.pid))
+        let fresh = orphans.filter { !announced.contains($0.pid) }
+        announced = now                       // auch Verschwundene vergessen
+        guard !fresh.isEmpty else { return }
+        let names = fresh.map(\.name).joined(separator: ", ")
+        Aero.shell("/usr/bin/osascript -e 'display notification " +
+                   "\"\(names) — AeroSpace verwaltet das Fenster nicht mehr\" " +
+                   "with title \"AeroPilot\"'")
+    }
 
     func refresh() {
         let fields = "%{window-id}%{workspace}%{window-layout}%{app-name}" +
@@ -461,9 +504,21 @@ final class Model: ObservableObject {
             _ = try? await NSWorkspace.shared.openApplication(at: url, configuration: cfg)
             try? await Task.sleep(nanoseconds: 5_000_000_000)
             self.refresh()
-            self.say(self.orphans.contains { $0.name == o.name }
-                     ? "\(o.name) neu gestartet, wird aber weiterhin nicht verwaltet."
-                     : "\(o.name) neu gestartet und wieder verwaltet. Layout ggf. richten.")
+            if self.orphans.contains(where: { $0.name == o.name }) {
+                self.say("\(o.name) neu gestartet, wird aber weiterhin nicht verwaltet.")
+                return
+            }
+            // Das neue Fenster hängt sich neben das zuletzt benutzte Fenster
+            // in dessen Container — nicht dorthin, wo das alte lag. Nach dem
+            // Neustart von Readwise Reader stand es deshalb als vierte
+            // Spalte neben Raindrop statt mit ihr in einer geteilten. Ohne
+            // Nacharbeit ist ein Neustart also immer eine halbe Reparatur.
+            if UserDefaults.standard.bool(forKey: Pref.relayoutAfterRestart) {
+                self.say("\(o.name) neu gestartet — Layout wird gerichtet …")
+                self.runScript("relayout.sh")
+            } else {
+                self.say("\(o.name) neu gestartet und wieder verwaltet. Layout ggf. richten.")
+            }
         }
     }
 
@@ -638,7 +693,7 @@ final class Model: ObservableObject {
 // ── Oberfläche ────────────────────────────────────────────────────────
 
 struct RootView: View {
-    @StateObject var m = Model()
+    @ObservedObject var m = Model.shared
     @State private var tab = 0
     @AppStorage(Pref.startTab)    private var startTab = 0
     @AppStorage(Pref.panelHeight) private var panelHeight = 380.0
@@ -974,6 +1029,8 @@ struct SettingsView: View {
     @AppStorage(Pref.keepBackups)   private var keepBackups = 10
     @AppStorage(Pref.checkOrphans)  private var checkOrphans = true
     @AppStorage(Pref.checkMisplaced) private var checkMisplaced = true
+    @AppStorage(Pref.watch)          private var watch = true
+    @AppStorage(Pref.relayoutAfterRestart) private var relayoutAfterRestart = true
 
     /// @AppStorage kann kein [String] — deshalb beim Öffnen aus den
     /// UserDefaults nachladen.
@@ -1048,6 +1105,14 @@ struct SettingsView: View {
                          + "und auf der normalen Fensterebene liegt.")
                         .font(.caption).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                    Toggle("Im Hintergrund prüfen und einmalig melden", isOn: $watch)
+                        .onChange(of: watch) { m.startWatch() }
+                    Text("Alle 60 s. Ohne das merkt man ein verlorenes Fenster erst, "
+                         + "wenn es beim Workspace-Wechsel liegenbleibt.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Toggle("Nach einem Neustart das Layout richten (relayout.sh)",
+                           isOn: $relayoutAfterRestart)
                     if !ignoredApps.isEmpty {
                         HStack(spacing: 8) {
                             Text("ignoriert: " + ignoredApps.joined(separator: ", "))
@@ -1168,7 +1233,12 @@ struct StatusBar: View {
 
 @main
 struct AeroPilotApp: App {
-    init() { Pref.registerDefaults() }
+    init() {
+        Pref.registerDefaults()
+        // Nicht im View starten: mit .menuBarExtraStyle(.window) entsteht
+        // die Ansicht erst beim ersten Öffnen des Popovers.
+        DispatchQueue.main.async { Model.shared.startWatch() }
+    }
 
     var body: some Scene {
         MenuBarExtra {
