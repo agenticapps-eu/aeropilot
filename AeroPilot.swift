@@ -38,6 +38,7 @@ enum Pref {
     static let checkMisplaced  = "checkMisplaced"
     static let relayoutAfterRestart = "relayoutAfterRestart"
     static let watch           = "watchInBackground"
+    static let watchInterval   = "watchIntervalSeconds"
 
     /// Erstwerte. UserDefaults liefert für unbekannte Schlüssel 0/false —
     /// deshalb müssen sinnvolle Vorgaben registriert werden, sonst startet
@@ -56,6 +57,7 @@ enum Pref {
             checkMisplaced: true,
             relayoutAfterRestart: true,
             watch: true,
+            watchInterval: 60,
         ])
     }
 }
@@ -328,14 +330,24 @@ final class Model: ObservableObject {
         // 60 s ist ein Kompromiss: die Prüfung kostet ein paar CLI-Aufrufe,
         // und schneller als „innerhalb einer Minute" muss die Meldung nicht
         // sein — der Schaden entsteht erst beim nächsten Workspace-Wechsel.
-        watchTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
+        // Über den Schlüssel watchIntervalSeconds änderbar, auch um beim
+        // Nachprüfen nicht minutenlang warten zu müssen:
+        //   defaults write de.donald.aeropilot watchIntervalSeconds -int 5
+        let secs = max(2.0, UserDefaults.standard.double(forKey: Pref.watchInterval))
+        watchTimer = Timer.scheduledTimer(withTimeInterval: secs, repeats: true) { _ in
             Task { @MainActor in Model.shared.watchTick() }
         }
         refresh()
         announced = Set(orphans.map(\.pid))   // beim Start nicht nachträglich meckern
+        watchTicks = 0
     }
 
+    /// Zähler, damit von aussen prüfbar ist, ob der Timer wirklich läuft.
+    private(set) var watchTicks = 0
+
     private func watchTick() {
+        watchTicks += 1
+        UserDefaults.standard.set(watchTicks, forKey: "watchTicks")
         refresh()
         let now = Set(orphans.map(\.pid))
         let fresh = orphans.filter { !announced.contains($0.pid) }
