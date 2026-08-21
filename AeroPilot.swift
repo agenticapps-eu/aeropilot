@@ -35,6 +35,7 @@ enum Pref {
     static let keepBackups     = "keepBackups"
     static let checkOrphans    = "checkOrphans"
     static let ignoredApps     = "ignoredApps"
+    static let checkMisplaced  = "checkMisplaced"
 
     /// Erstwerte. UserDefaults liefert für unbekannte Schlüssel 0/false —
     /// deshalb müssen sinnvolle Vorgaben registriert werden, sonst startet
@@ -50,6 +51,7 @@ enum Pref {
             keepBackups: 10,
             checkOrphans: true,
             ignoredApps: [String](),
+            checkMisplaced: true,
         ])
     }
 }
@@ -239,6 +241,33 @@ struct Orphan: Identifiable {
     var id: pid_t { pid }
 }
 
+/// Ein Fenster, das nicht auf dem Workspace liegt, den env/layout.conf
+/// vorsieht.
+///
+/// WOZU: `on-window-detected` greift nur, wenn ein Fenster erscheint —
+/// nie rückwirkend. Ändert man eine Regel oder nummeriert Workspaces um,
+/// bleibt jedes offene Fenster liegen, wo es war. Am 20.08.2026 lagen so
+/// sieben Fenster einen Tag lang auf ihren alten Nummern, während die
+/// Config längst stimmte. Von aussen sah es aus, als sei eine App
+/// weggerutscht — dabei war sie die einzige, die richtig lag.
+struct Misplaced: Identifiable {
+    let windowId: Int
+    let appName: String
+    let title: String
+    let current: String
+    let target: String
+    var id: Int { windowId }
+}
+
+/// Eine Zeile aus env/layout.conf: Bundle-ID, Ziel-Workspace, optionales
+/// Titelmuster. Reihenfolge ist bedeutungstragend — erste Übereinstimmung
+/// gewinnt, wie bei on-window-detected.
+struct LayoutRule {
+    let bundleId: String
+    let workspace: String      // "-" heisst: nicht zuordnen
+    let titlePattern: String?
+}
+
 /// Ein Skript aus dem env-Verzeichnis, das sich per Kopfzeile angemeldet hat.
 struct Script: Identifiable {
     let file: String
@@ -270,6 +299,7 @@ final class Model: ObservableObject {
     @Published var statusIsError = false
     @Published var scripts: [Script] = []
     @Published var orphans: [Orphan] = []
+    @Published var misplaced: [Misplaced] = []
 
     let configPath = NSHomeDirectory() + "/.config/aerospace/aerospace.toml"
     let envDir     = NSHomeDirectory() + "/.config/aerospace/env"
@@ -296,6 +326,59 @@ final class Model: ObservableObject {
         }
         loadScripts()
         findOrphans()
+        findMisplaced()
+    }
+
+    // ── Soll-Ist-Abgleich ─────────────────────────────────────────────
+
+    /// Liest env/layout.conf — dieselbe Datei, die auch relayout.sh liest.
+    /// Bewusst dieselbe: zwei Listen laufen auseinander, eine nicht.
+    func layoutRules() -> [LayoutRule] {
+        guard let text = try? String(contentsOfFile: envDir + "/layout.conf",
+                                     encoding: .utf8) else { return [] }
+        return text.split(separator: "\n").compactMap { raw in
+            let line = raw.split(separator: "#", maxSplits: 1,
+                                 omittingEmptySubsequences: false)[0]
+            let parts = line.split(whereSeparator: \.isWhitespace).map(String.init)
+            guard parts.count >= 2 else { return nil }
+            return LayoutRule(bundleId: parts[0], workspace: parts[1],
+                              titlePattern: parts.count > 2
+                                  ? parts[2...].joined(separator: " ") : nil)
+        }
+    }
+
+    func findMisplaced() {
+        guard UserDefaults.standard.bool(forKey: Pref.checkMisplaced) else {
+            misplaced = []; return
+        }
+        let rules = layoutRules()
+        guard !rules.isEmpty else { misplaced = []; return }
+
+        misplaced = windows.compactMap { w in
+            for r in rules where r.bundleId == w.appBundleId {
+                if let p = r.titlePattern,
+                   w.windowTitle.range(of: p, options: .regularExpression) == nil {
+                    continue          // spezifischere Regel passt nicht — weitersuchen
+                }
+                guard r.workspace != "-", r.workspace != w.workspace else { return nil }
+                return Misplaced(windowId: w.windowId, appName: w.appName,
+                                 title: w.windowTitle, current: w.workspace,
+                                 target: r.workspace)
+            }
+            return nil                // keine Regel für diese App
+        }
+    }
+
+    /// Nur die abweichenden Fenster verschieben — kein flatten, kein
+    /// balance. Wer das komplette Aufräumen will, nimmt relayout.sh.
+    func fixMisplaced() {
+        let todo = misplaced
+        for m in todo {
+            Aero.run(["move-node-to-workspace", "--window-id",
+                      String(m.windowId), m.target])
+        }
+        say("\(todo.count) Fenster einsortiert.")
+        refresh()
     }
 
     // ── Unverwaltete Fenster ──────────────────────────────────────────
@@ -602,6 +685,7 @@ struct WindowsView: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 2) {
                 if !m.orphans.isEmpty { OrphanBanner(m: m) }
+                if !m.misplaced.isEmpty { MisplacedBanner(m: m) }
                 ForEach(grouped, id: \.0) { ws, wins in
                     HStack(spacing: 6) {
                         Text("Workspace \(ws)").font(.caption).bold()
@@ -658,6 +742,46 @@ struct OrphanBanner: View {
         }
         .padding(10)
         .background(Color.orange.opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .padding(.horizontal, 10).padding(.top, 8)
+    }
+}
+
+/// Hinweis auf Fenster, die nicht dort liegen, wo env/layout.conf sie
+/// vorsieht. Blau statt orange: kein Defekt, nur Unordnung.
+struct MisplacedBanner: View {
+    @ObservedObject var m: Model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.left.arrow.right.square")
+                    .foregroundStyle(.blue)
+                Text("Fenster auf dem falschen Workspace")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Button("alle einsortieren") { m.fixMisplaced() }
+                    .buttonStyle(.borderedProminent).controlSize(.small)
+            }
+            Text("Regeln greifen nur, wenn ein Fenster erscheint — nie rückwirkend. "
+                 + "Soll-Zustand steht in env/layout.conf.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            ForEach(m.misplaced) { p in
+                HStack(spacing: 8) {
+                    Text(p.appName).font(.system(size: 12, weight: .medium))
+                    Text("\(p.current) → \(p.target)")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.blue)
+                    Text(p.title).font(.caption)
+                        .foregroundStyle(.secondary).lineLimit(1)
+                    Spacer()
+                }
+            }
+        }
+        .padding(10)
+        .background(Color.blue.opacity(0.10))
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .padding(.horizontal, 10).padding(.top, 8)
     }
@@ -845,6 +969,7 @@ struct SettingsView: View {
     @AppStorage(Pref.notify)        private var notify = false
     @AppStorage(Pref.keepBackups)   private var keepBackups = 10
     @AppStorage(Pref.checkOrphans)  private var checkOrphans = true
+    @AppStorage(Pref.checkMisplaced) private var checkMisplaced = true
 
     /// @AppStorage kann kein [String] — deshalb beim Öffnen aus den
     /// UserDefaults nachladen.
@@ -900,6 +1025,15 @@ struct SettingsView: View {
                     Toggle("Meldungen auch als macOS-Mitteilung", isOn: $notify)
                     Text("Nützlich, wenn ein Skript läuft und das Popover zuklappt.")
                         .font(.caption).foregroundStyle(.secondary)
+                }
+
+                group("Ordnung") {
+                    Toggle("Melden, wenn ein Fenster vom Soll-Workspace abweicht",
+                           isOn: $checkMisplaced)
+                    Text("Soll-Zustand: \(m.envDir)/layout.conf — dieselbe Datei, "
+                         + "die auch relayout.sh liest. \(m.layoutRules().count) Regeln geladen.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 group("Unverwaltete Fenster") {
@@ -1006,6 +1140,11 @@ struct StatusBar: View {
                         Label("\(m.orphans.count) unverwaltet",
                               systemImage: "exclamationmark.triangle.fill")
                             .font(.system(size: 10)).foregroundStyle(.orange)
+                    }
+                    if !m.misplaced.isEmpty {
+                        Label("\(m.misplaced.count) falsch einsortiert",
+                              systemImage: "arrow.left.arrow.right.square")
+                            .font(.system(size: 10)).foregroundStyle(.blue)
                     }
                 }
             }

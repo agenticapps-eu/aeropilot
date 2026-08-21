@@ -18,8 +18,9 @@ um das Fenster in einen anderen Workspace zu schieben. Optional zeigt jede
 Zeile die Bundle-ID zum Kopieren — praktisch, wenn man gerade eine
 `on-window-detected`-Regel schreibt und nicht raten will.
 
-Über der Liste erscheint eine Warnung, wenn **AeroSpace ein sichtbares
-Fenster nicht kennt** — siehe unten.
+Über der Liste erscheinen zwei Hinweise, wenn nötig: wenn **AeroSpace ein
+sichtbares Fenster nicht kennt**, und wenn ein Fenster **nicht auf dem
+Workspace liegt, den `env/layout.conf` vorsieht** — siehe unten.
 
 **Workspaces** — Übersicht mit Monitor und Fensterzahl, Klick springt hin,
 `flatten` + `balance-sizes` pro Workspace.
@@ -94,6 +95,33 @@ falsche: nur Fensterebene 0 (schliesst Overlays wie Raycast oder Alfred
 aus), nur sichtbare Fenster (Vollbild und andere macOS-Spaces verwaltet
 AeroSpace ohnehin nie), mindestens 300 × 200 px, und nur Apps mit Dock-Icon.
 Einzelne Apps lassen sich dauerhaft ignorieren.
+
+## Falsch einsortierte Fenster
+
+`on-window-detected` in AeroSpace greift **nur, wenn ein Fenster
+erscheint** — nie rückwirkend. Ändert man eine Regel oder nummeriert
+Workspaces um, bleibt jedes bereits offene Fenster liegen, wo es war. Bei
+Apps, die tagelang durchlaufen, kann das beliebig lange unbemerkt bleiben.
+
+AeroPilot liest deshalb `~/.config/aerospace/env/layout.conf` — eine
+schlichte Tabelle:
+
+```
+<bundle-id>   <workspace>   [<titel-regex>]
+```
+
+Erste Übereinstimmung gewinnt, wie bei `on-window-detected`; Workspace `-`
+heisst „nie melden". Abweichungen erscheinen als Hinweis mit einem Knopf,
+der sie einsortiert. Dieselbe Datei liest `relayout.sh` — eine Quelle
+statt zweier Listen, die auseinanderlaufen.
+
+Die Titelspalte ist nötig, weil sich manche Fenster nicht über die
+Bundle-ID unterscheiden lassen: Google Meet meldet sich als
+`com.google.Chrome`, und Teams-Meetingfenster sollen floaten statt
+einsortiert zu werden.
+
+Eine Beispieltabelle liegt in
+[agenticapps-eu/aerospace-setup](https://github.com/agenticapps-eu/aerospace-setup).
 
 ## Autostart
 
