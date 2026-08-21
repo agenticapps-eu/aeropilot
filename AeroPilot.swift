@@ -341,7 +341,11 @@ final class Model: ObservableObject {
                                  omittingEmptySubsequences: false)[0]
             let parts = line.split(whereSeparator: \.isWhitespace).map(String.init)
             guard parts.count >= 2 else { return nil }
-            return LayoutRule(bundleId: parts[0], workspace: parts[1],
+            // Ein führendes `+` markiert Apps, die build-all.sh öffnet —
+            // für die Zuordnung selbst spielt es keine Rolle.
+            let bundle = parts[0].hasPrefix("+")
+                ? String(parts[0].dropFirst()) : parts[0]
+            return LayoutRule(bundleId: bundle, workspace: parts[1],
                               titlePattern: parts.count > 2
                                   ? parts[2...].joined(separator: " ") : nil)
         }
