@@ -13,8 +13,9 @@ Abhängigkeiten.
 ## Was sie tut
 
 **Fenster** — alle offenen Fenster, nach Workspace gruppiert. Pro Zeile ein
-Klick, um zwischen *gekachelt* und *floatend* zu wechseln, und ein Dropdown,
-um das Fenster in einen anderen Workspace zu schieben. Optional zeigt jede
+Klick, um zwischen *gekachelt* und *floatend* zu wechseln, eine Nadel, um
+das Floaten dauerhaft zu machen, und ein Dropdown, um das Fenster in einen
+anderen Workspace zu schieben. Optional zeigt jede
 Zeile die Bundle-ID zum Kopieren — praktisch, wenn man gerade eine
 `on-window-detected`-Regel schreibt und nicht raten will.
 
@@ -95,6 +96,34 @@ falsche: nur Fensterebene 0 (schliesst Overlays wie Raycast oder Alfred
 aus), nur sichtbare Fenster (Vollbild und andere macOS-Spaces verwaltet
 AeroSpace ohnehin nie), mindestens 300 × 200 px, und nur Apps mit Dock-Icon.
 Einzelne Apps lassen sich dauerhaft ignorieren.
+
+## Floatend merken
+
+`aerospace layout floating` gilt nur für das Fenster, das gerade da ist.
+Startet die App neu, ist es ein anderes Fenster und wird wieder gekachelt —
+AeroSpace kennt keinen Zustand, der das überdauert. Dauerhaft wird es erst
+durch eine Regel in `on-window-detected`.
+
+Der Nadel-Knopf neben dem Layout-Symbol schreibt genau diese Regel. Nicht
+irgendwohin: AeroPilot verwaltet einen abgegrenzten Block direkt nach
+`on-window-detected = [`, zwischen zwei Markierungen. Alles ausserhalb
+bleibt unberührt — der Rest der Datei ist handgeschrieben und voller
+Kommentare, die eine Neuerzeugung vernichten würde.
+
+```toml
+  # ╔═ AeroPilot ═══ automatisch verwaltet ═══
+  { if = 'test %{app-bundle-id} = com.kagi.kagimacOS', check-further-callbacks = true, run = 'layout floating' },
+  # ╚═ Ende AeroPilot ═══════════════════════
+```
+
+`check-further-callbacks = true` ist hier keine Kosmetik: bei
+`on-window-detected` gewinnt die erste passende Regel. Ohne das Flag würde
+die Float-Regel die Workspace-Zuordnung darunter verhindern, und das
+Fenster bliebe liegen, wo es entstanden ist.
+
+Geschrieben wird über denselben Weg wie der Config-Editor — Sicherung,
+Validierung, Rückrollen bei `[ERROR]`. Die Regel gilt für **alle** Fenster
+der App, weil sie über die Bundle-ID trifft.
 
 ## Falsch einsortierte Fenster
 

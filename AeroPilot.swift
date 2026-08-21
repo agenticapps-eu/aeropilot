@@ -313,6 +313,9 @@ final class Model: ObservableObject {
     @Published var scripts: [Script] = []
     @Published var orphans: [Orphan] = []
     @Published var misplaced: [Misplaced] = []
+    /// Bundle-IDs mit dauerhafter Float-Regel. Bei jedem refresh() frisch
+    /// aus der Config gelesen — die Datei ist die Wahrheit, nicht die App.
+    @Published var floats: Set<String> = []
 
     let configPath = NSHomeDirectory() + "/.config/aerospace/aerospace.toml"
     let envDir     = NSHomeDirectory() + "/.config/aerospace/env"
@@ -382,6 +385,7 @@ final class Model: ObservableObject {
         loadScripts()
         findOrphans()
         findMisplaced()
+        floats = persistentFloats()
     }
 
     // ── Soll-Ist-Abgleich ─────────────────────────────────────────────
@@ -575,6 +579,80 @@ final class Model: ObservableObject {
         Aero.run(["balance-sizes", "--workspace", ws])
         say("Workspace \(ws) gleichmässig verteilt")
         refresh()
+    }
+
+    // ── Dauerhaft floaten ─────────────────────────────────────────────
+    //
+    // `aerospace layout floating` gilt nur für das laufende Fenster. Beim
+    // nächsten Start der App ist das Fenster ein neues und wird wieder
+    // gekachelt — es gibt in AeroSpace keinen Zustand, der das überdauert.
+    // Dauerhaft wird es nur durch eine Regel in `on-window-detected`.
+    //
+    // Deshalb verwaltet die App einen abgegrenzten Block in der
+    // aerospace.toml. Nicht die ganze Datei neu schreiben: der Rest ist
+    // handgeschrieben und voller Kommentare, die eine Neuerzeugung
+    // vernichten würde. Nur der Bereich zwischen den beiden Markierungen
+    // gehört der App.
+
+    static let floatBegin = "# ╔═ AeroPilot ═══ automatisch verwaltet ═══"
+    static let floatEnd   = "# ╚═ Ende AeroPilot ═══════════════════════"
+
+    /// Bundle-IDs, für die eine dauerhafte Float-Regel existiert.
+    func persistentFloats() -> Set<String> {
+        let lines = loadConfig().split(separator: "\n", omittingEmptySubsequences: false)
+        guard let from = lines.firstIndex(where: { $0.contains(Self.floatBegin) }),
+              let to = lines.firstIndex(where: { $0.contains(Self.floatEnd) }), from < to
+        else { return [] }
+        var out = Set<String>()
+        for line in lines[from...to] {
+            guard let r = line.range(of: "app-bundle-id} = ") else { continue }
+            let rest = line[r.upperBound...]
+            let id = rest.prefix { !$0.isWhitespace && $0 != "'" && $0 != "," }
+            if !id.isEmpty { out.insert(String(id)) }
+        }
+        return out
+    }
+
+    func setPersistentFloat(_ bundleId: String, _ on: Bool) {
+        var ids = persistentFloats()
+        if on { ids.insert(bundleId) } else { ids.remove(bundleId) }
+
+        var lines = loadConfig().split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+
+        // alten Block entfernen
+        if let from = lines.firstIndex(where: { $0.contains(Self.floatBegin) }),
+           let to = lines.firstIndex(where: { $0.contains(Self.floatEnd) }), from <= to {
+            lines.removeSubrange(from...to)
+        }
+
+        if !ids.isEmpty {
+            guard let anchor = lines.firstIndex(where: {
+                $0.trimmingCharacters(in: .whitespaces).hasPrefix("on-window-detected = [")
+            }) else {
+                say("`on-window-detected = [` nicht gefunden — nichts geändert.", error: true)
+                return
+            }
+            var block = [
+                "  " + Self.floatBegin,
+                "  # In AeroPilot gesetzt: Fenster dieser Apps floaten immer.",
+                "  # Von Hand hier nichts ändern — die App ersetzt den Block ganz.",
+                "  #",
+                "  # check-further-callbacks: floaten UND die Regeln darunter",
+                "  # weiterhin durchlaufen. Ohne das gewönne diese Regel als erste",
+                "  # passende, und die Workspace-Zuordnung fiele aus.",
+            ]
+            for id in ids.sorted() {
+                block.append("  { if = 'test %{app-bundle-id} = \(id)', " +
+                             "check-further-callbacks = true, run = 'layout floating' },")
+            }
+            block.append("  " + Self.floatEnd)
+            block.append("")
+            lines.insert(contentsOf: block, at: anchor + 1)
+        }
+
+        // Über saveAndReload: sichert, prüft und rollt bei Fehlern zurück.
+        saveAndReload(lines.joined(separator: "\n"))
     }
 
     // ── Config ────────────────────────────────────────────────────────
@@ -864,6 +942,10 @@ struct WindowRow: View {
     @AppStorage(Pref.showTitles)    private var showTitles = true
     @AppStorage(Pref.showBundleIds) private var showBundleIds = false
 
+    /// Gilt pro App, nicht pro Fenster: die Regel in der Config trifft über
+    /// die Bundle-ID, also alle Fenster dieser App.
+    var pinned: Bool { m.floats.contains(w.appBundleId) }
+
     var body: some View {
         HStack(spacing: 8) {
             Button {
@@ -876,6 +958,20 @@ struct WindowRow: View {
             .buttonStyle(.borderless)
             .help(w.isFloating ? "floatend — klicken für gekachelt"
                                : "gekachelt — klicken für floatend")
+
+            // Merken. `layout floating` überlebt keinen App-Neustart —
+            // dauerhaft wird es erst durch eine Regel in der Config.
+            Button {
+                m.setPersistentFloat(w.appBundleId, !pinned)
+            } label: {
+                Image(systemName: pinned ? "pin.fill" : "pin")
+                    .foregroundStyle(pinned ? AnyShapeStyle(Color.accentColor)
+                                            : AnyShapeStyle(.tertiary))
+            }
+            .buttonStyle(.borderless)
+            .help(pinned
+                  ? "\(w.appName) floatet dauerhaft — klicken zum Aufheben"
+                  : "floatend merken: Regel in die Config schreiben, gilt für alle Fenster von \(w.appName)")
 
             VStack(alignment: .leading, spacing: 0) {
                 Text(w.appName).font(.system(size: 12, weight: .medium))
