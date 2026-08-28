@@ -36,7 +36,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <dict>
   <key>CFBundleName</key>              <string>AeroPilot</string>
   <key>CFBundleDisplayName</key>       <string>AeroPilot</string>
-  <key>CFBundleIdentifier</key>        <string>de.donald.aeropilot</string>
+  <key>CFBundleIdentifier</key>        <string>de.donald.aeropilot2</string>
   <key>CFBundleVersion</key>           <string>1.0</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>CFBundleExecutable</key>        <string>AeroPilot</string>

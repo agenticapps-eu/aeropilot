@@ -63,68 +63,55 @@ enum Pref {
 }
 
 // ── Autostart ─────────────────────────────────────────────────────────
-// Zwei Wege, weil der schöne nicht immer funktioniert:
+// Nur noch LaunchAgent. Das war früher der Notnagel; seit dem 28.08.2026
+// ist es der einzige Weg.
 //
-//  1. SMAppService (Apple-Weg) — die App erscheint in den Systemeinstellungen
-//     unter „Anmeldeobjekte“. Braucht eine gültige Signatur; bei einer
-//     ad-hoc signierten, selbst gebauten App kann `register()` scheitern
-//     oder auf `requiresApproval` stehen bleiben.
-//  2. LaunchAgent — eine plist in ~/Library/LaunchAgents, von launchd
-//     geladen. Funktioniert ohne Signatur, taucht aber nicht in den
-//     Systemeinstellungen auf.
+// **Warum SMAppService rausgeflogen ist.** Apples Weg trägt die App in die
+// Background-Task-Datenbank ein. Wird eine App währenddessen hart beendet —
+// etwa durch ein `pkill` mitten im Start —, bleibt dort ein kaputter Eintrag
+// zurück, der die Bundle-ID *dauerhaft* blockiert: Die App startet, launchd
+// meldet „Successfully spawned“, und eine Sekunde später ist sie wieder weg.
+// Das überlebt Neubauen, Neusignieren, `lsregister -u` und einen Pfadwechsel.
+// Genau das ist AeroPilot am 27.08.2026 passiert; nur die neue Kennung
+// `de.donald.aeropilot2` hat geholfen.
 //
-// Beim Einschalten wird 1 versucht und bei Fehler automatisch auf 2
-// zurückgefallen. Ausschalten räumt beides ab — sonst startet die App
-// womöglich zweimal.
+// Ein LaunchAgent ist dagegen eine Datei. Man kann sie anlegen, ansehen und
+// löschen, und niemand muss raten, was das System sich gemerkt hat.
+//
+// **Und warum `open -a` statt des Binaries direkt:** Eine Menubar-App, die
+// nicht über LaunchServices gestartet wird, beendet sich sofort wieder —
+// ihr fehlt der GUI-Kontext. Der alte Notnagel trug den Binärpfad ein und
+// hätte deshalb vermutlich nie funktioniert. `open` nimmt den richtigen Weg.
+//
+// Preis: Der Eintrag steht in den Systemeinstellungen unter „Anmeldeobjekte
+// & Erweiterungen“ im unteren Abschnitt, nicht als schöner App-Eintrag oben.
+// Dafür funktioniert er.
 
 enum Autostart {
-    enum Mode: String { case off, loginItem, launchAgent }
+    enum Mode: String { case off, launchAgent }
 
-    static let label = "de.donald.aeropilot"
+    static let label = "de.donald.aeropilot2"
     static var plistPath: String {
         NSHomeDirectory() + "/Library/LaunchAgents/\(label).plist"
     }
 
-    static var mode: Mode {
-        if FileManager.default.fileExists(atPath: plistPath) { return .launchAgent }
-        return SMAppService.mainApp.status == .enabled ? .loginItem : .off
+    /// Die Kennung von früher. Wird beim Ein- und Ausschalten mit abgeräumt,
+    /// damit nicht eine vergessene plist die App ein zweites Mal startet.
+    private static let altesLabel = "de.donald.aeropilot"
+    private static var alterPlistPath: String {
+        NSHomeDirectory() + "/Library/LaunchAgents/\(altesLabel).plist"
     }
 
-    /// `.requiresApproval` heisst: registriert, aber vom Nutzer in den
-    /// Systemeinstellungen deaktiviert. Kein Fehler, aber auch kein Autostart.
-    static var needsApproval: Bool {
-        SMAppService.mainApp.status == .requiresApproval
+    static var mode: Mode {
+        FileManager.default.fileExists(atPath: plistPath) ? .launchAgent : .off
     }
+
+    /// Bleibt bestehen, damit die Oberfläche unverändert baut — bei einem
+    /// LaunchAgent gibt es aber nichts freizugeben.
+    static var needsApproval: Bool { false }
 
     static func enable() -> String {
-        do {
-            try SMAppService.mainApp.register()
-            if needsApproval {
-                return "Registriert, aber noch nicht freigegeben — " +
-                       "in den Systemeinstellungen einschalten."
-            }
-            return "Autostart über Anmeldeobjekte aktiv."
-        } catch {
-            let r = installLaunchAgent()
-            return "Anmeldeobjekt fehlgeschlagen (\(error.localizedDescription)) — " +
-                   "LaunchAgent stattdessen: \(r)"
-        }
-    }
-
-    static func disable() -> String {
-        var parts: [String] = []
-        do { try SMAppService.mainApp.unregister() ; parts.append("Anmeldeobjekt entfernt") }
-        catch { /* war nie registriert — nichts zu melden */ }
-        if FileManager.default.fileExists(atPath: plistPath) {
-            Aero.shell("/bin/launchctl bootout gui/$(id -u)/\(label) 2>/dev/null; " +
-                       "rm -f '\(plistPath)'")
-            parts.append("LaunchAgent entfernt")
-        }
-        return parts.isEmpty ? "Autostart war nicht aktiv." : parts.joined(separator: ", ") + "."
-    }
-
-    private static func installLaunchAgent() -> String {
-        guard let exe = Bundle.main.executablePath else { return "Pfad unbekannt" }
+        let app = Bundle.main.bundleURL.path
         let plist = """
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" \
@@ -132,8 +119,14 @@ enum Autostart {
         <plist version="1.0">
         <dict>
           <key>Label</key><string>\(label)</string>
-          <key>ProgramArguments</key><array><string>\(exe)</string></array>
+          <key>ProgramArguments</key>
+          <array>
+            <string>/usr/bin/open</string>
+            <string>-a</string>
+            <string>\(app)</string>
+          </array>
           <key>RunAtLoad</key><true/>
+          <key>LimitLoadToSessionType</key><string>Aqua</string>
         </dict>
         </plist>
         """
@@ -141,9 +134,36 @@ enum Autostart {
         try? FileManager.default.createDirectory(atPath: dir,
                                                 withIntermediateDirectories: true)
         do { try plist.write(toFile: plistPath, atomically: true, encoding: .utf8) }
-        catch { return "plist nicht schreibbar" }
-        let r = Aero.shell("/bin/launchctl bootstrap gui/$(id -u) '\(plistPath)'")
-        return r.code == 0 ? "geladen" : "plist liegt, launchctl meldet: \(r.err)"
+        catch { return "plist nicht schreibbar — Autostart nicht aktiv." }
+        raeumeAltesAuf()
+        let r = Aero.shell("/bin/launchctl bootout gui/$(id -u)/\(label) 2>/dev/null; " +
+                           "/bin/launchctl bootstrap gui/$(id -u) '\(plistPath)'")
+        return r.code == 0
+            ? "Autostart aktiv (LaunchAgent)."
+            : "plist liegt, launchctl meldet: \(r.err)"
+    }
+
+    static func disable() -> String {
+        var teile: [String] = []
+        if FileManager.default.fileExists(atPath: plistPath) {
+            Aero.shell("/bin/launchctl bootout gui/$(id -u)/\(label) 2>/dev/null; " +
+                       "rm -f '\(plistPath)'")
+            teile.append("LaunchAgent entfernt")
+        }
+        if FileManager.default.fileExists(atPath: alterPlistPath) {
+            raeumeAltesAuf()
+            teile.append("alte plist mit entfernt")
+        }
+        // Falls aus einer früheren Version noch eine SMAppService-Registrierung
+        // herumliegt: einmal still abmelden.
+        try? SMAppService.mainApp.unregister()
+        return teile.isEmpty ? "Autostart war nicht aktiv." : teile.joined(separator: ", ") + "."
+    }
+
+    private static func raeumeAltesAuf() {
+        guard FileManager.default.fileExists(atPath: alterPlistPath) else { return }
+        Aero.shell("/bin/launchctl bootout gui/$(id -u)/\(altesLabel) 2>/dev/null; " +
+                   "rm -f '\(alterPlistPath)'")
     }
 
     /// Direkt zum Anmeldeobjekte-Bereich der Systemeinstellungen.
@@ -1162,7 +1182,7 @@ struct SettingsView: View {
                         }))
                     HStack(spacing: 6) {
                         Text(modeText).font(.caption).foregroundStyle(.secondary)
-                        if mode == .loginItem || Autostart.needsApproval {
+                        if mode != .off {
                             Button("Systemeinstellungen") { Autostart.openSystemSettings() }
                                 .buttonStyle(.link).font(.caption)
                         }
@@ -1274,10 +1294,8 @@ struct SettingsView: View {
     var modeText: String {
         switch mode {
         case .off:         return "nicht eingerichtet"
-        case .loginItem:   return Autostart.needsApproval
-                                  ? "als Anmeldeobjekt registriert, aber deaktiviert"
-                                  : "als Anmeldeobjekt aktiv"
-        case .launchAgent: return "über LaunchAgent aktiv (nicht in den Systemeinstellungen sichtbar)"
+        case .launchAgent: return "über LaunchAgent aktiv — in den Systemeinstellungen " +
+                                  "unter „Anmeldeobjekte & Erweiterungen“ im unteren Abschnitt"
         }
     }
 
