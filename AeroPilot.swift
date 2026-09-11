@@ -800,6 +800,140 @@ final class Model: ObservableObject {
     }
 }
 
+// ── Aussehen ──────────────────────────────────────────────────────────
+// Eine Menüleisten-App wird im Vorbeigehen benutzt. Farbe und Symbol
+// sind deshalb kein Zierrat: sie sind der schnellste Weg, eine Zeile zu
+// erkennen, ohne sie zu lesen. Gleiche Gruppe = gleiche Farbe, immer.
+
+enum Look {
+    /// Symbol und Farbe je Skriptgruppe. Unbekannte Gruppen bekommen
+    /// bewusst ein neutrales Grau statt einer zufälligen Farbe — sonst
+    /// verliert die Zuordnung ihre Aussage.
+    static func group(_ name: String) -> (icon: String, tint: Color) {
+        switch name {
+        case "Aufbauen":          return ("hammer.fill",            .orange)
+        case "Ghostty":           return ("terminal.fill",          .green)
+        case "Workspace starten": return ("square.grid.2x2.fill",   .blue)
+        case "AeroSpace":         return ("gearshape.fill",         .purple)
+        default:                  return ("chevron.right.circle",   .gray)
+        }
+    }
+
+    /// Symbol je Eintrag, geraten aus dem Text. Trifft es nicht, gilt
+    /// das Gruppensymbol — nie ein falsches.
+    static func script(_ label: String, group: String) -> String {
+        let l = label.lowercased()
+        if l.contains("laptop")        { return "laptopcomputer" }
+        if l.contains("monitorwechsel"){ return "display.2" }
+        if l.contains("alles")         { return "square.stack.3d.up.fill" }
+        if l.contains("layouts")       { return "arrow.up.left.and.arrow.down.right" }
+        if l.contains("herdr")         { return "chevron.left.forwardslash.chevron.right" }
+        if l.contains("hermes") || l.contains("homelab") { return "network" }
+        if l.contains("terminal")      { return "terminal" }
+        if l.hasPrefix("1 ")           { return "1.square.fill" }
+        if l.hasPrefix("2 ")           { return "2.square.fill" }
+        if l.hasPrefix("3 ")           { return "3.square.fill" }
+        if l.hasPrefix("4 ")           { return "4.square.fill" }
+        if l.hasPrefix("5 ")           { return "5.square.fill" }
+        if l.hasPrefix("6 ")           { return "6.square.fill" }
+        if l.hasPrefix("7 ")           { return "7.square.fill" }
+        return Look.group(group).icon
+    }
+}
+
+/// Eine anklickbare Zeile mit Symbolplakette, Titel und optionaler
+/// Tastenkappe. Hebt sich beim Überfahren hervor — ohne das wirkt eine
+/// Liste aus Text tot, weil nichts zurückmeldet, dass sie anfassbar ist.
+struct ActionRow: View {
+    let icon: String
+    let tint: Color
+    let title: String
+    var subtitle: String? = nil
+    var key: String? = nil
+    let action: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(tint.opacity(hovering ? 0.28 : 0.16))
+                        .frame(width: 26, height: 26)
+                    Image(systemName: icon)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(tint)
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    if let subtitle, !subtitle.isEmpty {
+                        Text(subtitle)
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                Spacer(minLength: 6)
+                if let key, !key.isEmpty { Keycap(text: key) }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.primary.opacity(hovering ? 0.07 : 0))
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+    }
+}
+
+/// Tastenkürzel als Kappe statt als Fliesstext — so liest man sie als
+/// Taste und nicht als Teil des Satzes.
+struct Keycap: View {
+    let text: String
+    var body: some View {
+        Text(text.replacingOccurrences(of: "alt-", with: "⌥")
+                 .replacingOccurrences(of: "ctrl-", with: "⌃")
+                 .replacingOccurrences(of: "shift-", with: "⇧")
+                 .replacingOccurrences(of: "cmd-", with: "⌘"))
+            .font(.system(size: 10, weight: .medium, design: .rounded))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .background(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(Color.primary.opacity(0.07))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .strokeBorder(Color.primary.opacity(0.10), lineWidth: 0.5)
+                    )
+            )
+    }
+}
+
+/// Kleine Statusmarke für die Kopfzeile.
+struct Pill: View {
+    let icon: String
+    let text: String
+    var tint: Color = .secondary
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon).font(.system(size: 9, weight: .semibold))
+            Text(text).font(.system(size: 10, weight: .medium))
+        }
+        .foregroundStyle(tint)
+        .padding(.horizontal, 7).padding(.vertical, 3)
+        .background(
+            Capsule().fill(tint.opacity(0.13))
+        )
+    }
+}
+
 // ── Oberfläche ────────────────────────────────────────────────────────
 
 struct RootView: View {
@@ -808,19 +942,20 @@ struct RootView: View {
     @AppStorage(Pref.startTab)    private var startTab = 0
     @AppStorage(Pref.panelHeight) private var panelHeight = 380.0
 
+    private let tabs: [(String, String)] = [
+        ("Fenster",    "macwindow"),
+        ("Workspaces", "square.grid.2x2"),
+        ("Config",     "doc.text"),
+        ("Aktionen",   "bolt.fill"),
+        ("App",        "gearshape"),
+    ]
+
     var body: some View {
         VStack(spacing: 0) {
-            Picker("", selection: $tab) {
-                Text("Fenster").tag(0)
-                Text("Workspaces").tag(1)
-                Text("Config").tag(2)
-                Text("Aktionen").tag(3)
-                Text("App").tag(4)
-            }
-            .pickerStyle(.segmented)
-            .padding(10)
+            header
+            tabBar
 
-            Divider()
+            Divider().opacity(0.5)
 
             Group {
                 switch tab {
@@ -833,11 +968,81 @@ struct RootView: View {
             }
             .frame(height: panelHeight)
 
-            Divider()
+            Divider().opacity(0.5)
             StatusBar(m: m)
         }
         .frame(width: 560)
+        .background(.ultraThinMaterial)
         .onAppear { tab = startTab; m.refresh() }
+    }
+
+    /// Kopfzeile: wer bin ich, und wie steht es gerade. Die Marken rechts
+    /// beantworten die zwei Fragen, wegen derer man das Menü überhaupt
+    /// aufklappt — wie viele Monitore sieht AeroSpace, und stimmt etwas
+    /// nicht.
+    private var header: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "square.split.2x2.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.tint)
+            Text("AeroPilot")
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+            Spacer()
+            if !m.orphans.isEmpty {
+                Pill(icon: "exclamationmark.triangle.fill",
+                     text: "\(m.orphans.count)", tint: .orange)
+            }
+            if !m.misplaced.isEmpty {
+                Pill(icon: "arrow.left.arrow.right",
+                     text: "\(m.misplaced.count)", tint: .blue)
+            }
+            Pill(icon: "macwindow", text: "\(m.windows.count)")
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 10)
+        .padding(.bottom, 8)
+    }
+
+    /// Eigene Reiterleiste statt Segmented Control: Symbole sind auf
+    /// einen Blick unterscheidbar, fünf Textschnipsel nicht.
+    private var tabBar: some View {
+        HStack(spacing: 2) {
+            ForEach(Array(tabs.enumerated()), id: \.offset) { i, t in
+                TabButton(title: t.0, icon: t.1, selected: tab == i) {
+                    tab = i
+                }
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.bottom, 8)
+    }
+}
+
+struct TabButton: View {
+    let title: String
+    let icon: String
+    let selected: Bool
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: icon).font(.system(size: 11, weight: .semibold))
+                Text(title).font(.system(size: 11, weight: selected ? .semibold : .regular))
+            }
+            .foregroundStyle(selected ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+            .padding(.horizontal, 9).padding(.vertical, 5)
+            .frame(maxWidth: .infinity)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(selected ? Color.accentColor.opacity(0.15)
+                                   : Color.primary.opacity(hovering ? 0.06 : 0))
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
     }
 }
 
@@ -1090,56 +1295,67 @@ struct ActionsView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 14) {
                 ForEach(m.scriptGroups, id: \.0) { group, scripts in
                     section(group) {
                         ForEach(scripts) { s in
-                            row(s.label, s.key) { m.runScript(s.file) }
+                            ActionRow(icon: Look.script(s.label, group: group),
+                                      tint: Look.group(group).tint,
+                                      title: s.label,
+                                      key: s.key) { m.runScript(s.file) }
                         }
                     }
                 }
                 if m.scripts.isEmpty {
                     Text("Keine Skripte in \(m.envDir)")
                         .font(.caption).foregroundStyle(.secondary)
-                        .padding(.horizontal, 12)
+                        .padding(.horizontal, 14)
                 }
                 section("AeroSpace") {
-                    row("Config neu laden", nil) {
+                    ActionRow(icon: "arrow.clockwise", tint: .purple,
+                              title: "Config neu laden",
+                              subtitle: "nach jedem Monitorwechsel") {
                         let r = Aero.run(["reload-config"])
                         let t = (r.out + r.err).trimmingCharacters(in: .whitespacesAndNewlines)
                         m.say(t.isEmpty ? "Config neu geladen" : t,
                               error: t.contains("[ERROR]"))
                     }
-                    row("Tiling AUS (Notbremse)", nil) {
+                    ActionRow(icon: "pause.circle.fill", tint: .red,
+                              title: "Tiling AUS", subtitle: "Notbremse") {
                         Aero.run(["enable", "off"]); m.say("Tiling aus")
                     }
-                    row("Tiling EIN", nil) {
+                    ActionRow(icon: "play.circle.fill", tint: .green,
+                              title: "Tiling EIN") {
                         Aero.run(["enable", "on"]); m.say("Tiling ein"); m.refresh()
                     }
                 }
-                Text(m.version).font(.caption2).foregroundStyle(.secondary)
-                    .padding(.horizontal, 12)
+                Text(m.version).font(.caption2).foregroundStyle(.tertiary)
+                    .padding(.horizontal, 14)
             }
-            .padding(.vertical, 10)
+            .padding(.vertical, 12)
         }
     }
 
+    /// Gruppenkopf mit Symbol und Farbe. Die Farbe wiederholt sich in
+    /// jeder Zeile der Gruppe — dadurch liest man die Zugehörigkeit,
+    /// ohne die Überschrift zu suchen.
     func section<C: View>(_ title: String, @ViewBuilder _ c: () -> C) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title).font(.caption).bold()
-                .foregroundStyle(.secondary).padding(.horizontal, 12)
-            c()
+        let look = Look.group(title)
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 5) {
+                Image(systemName: look.icon)
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(look.tint)
+                Text(title.uppercased())
+                    .font(.system(size: 9, weight: .bold, design: .rounded))
+                    .foregroundStyle(.secondary)
+                    .kerning(0.6)
+                Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 1)
+            }
+            .padding(.horizontal, 14)
+            .padding(.bottom, 1)
+            VStack(spacing: 1) { c() }.padding(.horizontal, 6)
         }
-    }
-
-    func row(_ label: String, _ key: String?, _ action: @escaping () -> Void) -> some View {
-        HStack {
-            Button(label, action: action).buttonStyle(.link).font(.system(size: 12))
-            Spacer()
-            if let key { Text(key).font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(.secondary) }
-        }
-        .padding(.horizontal, 12).padding(.vertical, 1)
     }
 }
 
@@ -1344,14 +1560,42 @@ struct StatusBar: View {
                 }
             }
             Spacer()
-            Button { m.refresh(); m.say("") } label: {
-                Image(systemName: "arrow.clockwise")
+            IconButton(icon: "arrow.clockwise", help: "Neu einlesen") {
+                m.refresh(); m.say("")
             }
-            .buttonStyle(.borderless)
-            Button("Beenden") { NSApplication.shared.terminate(nil) }
-                .buttonStyle(.link).font(.system(size: 10))
+            IconButton(icon: "power", help: "AeroPilot beenden", tint: .red) {
+                NSApplication.shared.terminate(nil)
+            }
         }
-        .padding(8)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+    }
+}
+
+/// Runder Symbolknopf für die Fusszeile. `.borderless` wirkt auf
+/// dunklem Material wie totes Bild — ein eigener Hover-Hintergrund
+/// zeigt, dass da etwas anklickbar ist.
+struct IconButton: View {
+    let icon: String
+    let help: String
+    var tint: Color = .secondary
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(hovering ? tint : .secondary)
+                .frame(width: 22, height: 22)
+                .background(
+                    Circle().fill(tint.opacity(hovering ? 0.15 : 0))
+                )
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .onHover { hovering = $0 }
     }
 }
 
