@@ -218,6 +218,74 @@ enum Aero {
     }
 }
 
+// BEGIN ConfigFile
+/// Resolve the live symlink once; atomically replace its target, retaining all text.
+enum ConfigFile {
+    enum Failure: Error { case invalidConfiguration }
+    static func save(_ text: String, path: String, validate: () -> Bool) throws {
+        let target = URL(fileURLWithPath: path).resolvingSymlinksInPath()
+        let previous = try String(contentsOf: target, encoding: .utf8)
+        try text.write(to: target, atomically: true, encoding: .utf8)
+        guard validate() else {
+            try previous.write(to: target, atomically: true, encoding: .utf8)
+            throw Failure.invalidConfiguration
+        }
+    }
+}
+// END ConfigFile
+
+// BEGIN MonitorChangeObserver
+/// Display notifications arrive in bursts while a dock negotiates displays.
+/// Reload once after they settle; never rebuild workspaces or terminal windows.
+@MainActor
+final class MonitorChangeObserver {
+    private let center: NotificationCenter
+    private let delay: TimeInterval
+    private let signature: () -> String
+    private let reload: () -> Void
+    private var observer: NSObjectProtocol?
+    private var pending: Task<Void, Never>?
+    private var observed = ""
+
+    init(center: NotificationCenter = .default, delay: TimeInterval = 2,
+         signature: @escaping () -> String, reload: @escaping () -> Void) {
+        self.center = center
+        self.delay = delay
+        self.signature = signature
+        self.reload = reload
+    }
+
+    func start() {
+        guard observer == nil else { return }
+        observed = signature()
+        observer = center.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.changed() }
+        }
+    }
+
+    private func changed() {
+        let next = signature()
+        guard next != observed else { return }
+        observed = next
+        pending?.cancel()
+        pending = Task { [weak self] in
+            guard let self else { return }
+            do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
+            catch { return }
+            guard !Task.isCancelled else { return }
+            // A changed signature without a delivered notification also gets
+            // a settling period. A transient empty display set is not actionable.
+            guard signature() == observed else { changed(); return }
+            guard !observed.isEmpty else { return }
+            reload()
+        }
+    }
+}
+// END MonitorChangeObserver
+
 // ── Datenmodell ───────────────────────────────────────────────────────
 
 struct Win: Identifiable, Decodable {
@@ -340,6 +408,38 @@ final class Model: ObservableObject {
     let configPath = NSHomeDirectory() + "/.config/aerospace/aerospace.toml"
     let envDir     = NSHomeDirectory() + "/.config/aerospace/env"
 
+    private lazy var monitorChanges = MonitorChangeObserver(signature: {
+        NSScreen.screens.map { screen in
+            let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
+            return "\(id?.uint32Value ?? 0):\(NSStringFromRect(screen.frame)):\(screen.backingScaleFactor):\(CGMainDisplayID())"
+        }.sorted().joined(separator: "|")
+    }, reload: { [weak self] in
+        self?.reconcileMonitors()
+    })
+
+    func reconcileMonitors() {
+        let path = envDir + "/monitorwechsel.sh"
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result = FileManager.default.fileExists(atPath: path)
+                ? Aero.shell(path) : Aero.run(["reload-config"])
+            let message = result.code == 0
+                ? "Monitorprofil abgeglichen. " + result.out.trimmingCharacters(in: .whitespacesAndNewlines)
+                : "Monitorabgleich fehlgeschlagen: " + result.err
+            NSLog("%@", message)
+            DispatchQueue.main.async {
+                UserDefaults.standard.set(message, forKey: "lastMonitorReloadResult")
+                UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "lastMonitorReloadAt")
+                self?.say(message, error: result.code != 0)
+                self?.refresh()
+            }
+        }
+    }
+
+    func startMonitorWatch() {
+        monitorChanges.start()
+        reconcileMonitors()
+    }
+
     // ── Hintergrundprüfung ────────────────────────────────────────────
     // Ein verlorenes Fenster meldet sich nicht. Man merkt es erst, wenn
     // es beim Workspace-Wechsel liegenbleibt — oft Stunden später. Also
@@ -413,7 +513,11 @@ final class Model: ObservableObject {
     /// Liest env/layout.conf — dieselbe Datei, die auch relayout.sh liest.
     /// Bewusst dieselbe: zwei Listen laufen auseinander, eine nicht.
     func layoutRules() -> [LayoutRule] {
-        guard let text = try? String(contentsOfFile: envDir + "/layout.conf",
+        let statePath = NSHomeDirectory() + "/.local/state/aerospace/profile.json"
+        let state = (try? Data(contentsOf: URL(fileURLWithPath: statePath)))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        let laptop = state?["version"] as? Int == 1 && state?["profile"] as? String == "laptop"
+        guard let text = try? String(contentsOfFile: envDir + (laptop ? "/layout.laptop.conf" : "/layout.conf"),
                                      encoding: .utf8) else { return [] }
         return text.split(separator: "\n").compactMap { raw in
             let line = raw.split(separator: "#", maxSplits: 1,
@@ -438,7 +542,7 @@ final class Model: ObservableObject {
         guard !rules.isEmpty else { misplaced = []; return }
 
         misplaced = windows.compactMap { w in
-            for r in rules where r.bundleId == w.appBundleId {
+            for r in rules where r.bundleId == w.appBundleId || r.bundleId == "*" {
                 if let p = r.titlePattern,
                    w.windowTitle.range(of: p, options: .regularExpression) == nil {
                     continue          // spezifischere Regel passt nicht — weitersuchen
@@ -595,7 +699,6 @@ final class Model: ObservableObject {
     }
 
     func balance(_ ws: String) {
-        Aero.run(["flatten-workspace-tree", "--workspace", ws])
         Aero.run(["balance-sizes", "--workspace", ws])
         say("Workspace \(ws) gleichmässig verteilt")
         refresh()
@@ -686,8 +789,8 @@ final class Model: ObservableObject {
     func validate() -> (ok: Bool, message: String) {
         let r = Aero.run(["reload-config", "--dry-run"])
         let text = (r.out + r.err).trimmingCharacters(in: .whitespacesAndNewlines)
-        if text.isEmpty { return (true, "Keine Fehler, keine Warnungen.") }
-        return (!text.contains("[ERROR]"), text)
+        if text.isEmpty && r.code == 0 { return (true, "Keine Fehler, keine Warnungen.") }
+        return (r.code == 0 && !text.contains("[ERROR]"), text)
     }
 
     /// Speichert und lädt neu. Vorher wird die alte Fassung weggesichert,
@@ -697,13 +800,10 @@ final class Model: ObservableObject {
         let previous = loadConfig()
         try? previous.write(toFile: backup, atomically: true, encoding: .utf8)
 
-        do { try text.write(toFile: configPath, atomically: true, encoding: .utf8) }
-        catch { say("Schreiben fehlgeschlagen: \(error)", error: true); return }
-
-        let v = validate()
-        if !v.ok {
-            try? previous.write(toFile: configPath, atomically: true, encoding: .utf8)
-            say("Fehler — zurückgerollt:\n" + v.message, error: true)
+        do {
+            try ConfigFile.save(text, path: configPath) { self.validate().ok }
+        } catch {
+            say("Speichern abgebrochen, vorherige Konfiguration erhalten: \(error)", error: true)
             return
         }
         let r = Aero.run(["reload-config"])
@@ -1607,7 +1707,10 @@ struct AeroPilotApp: App {
         Pref.registerDefaults()
         // Nicht im View starten: mit .menuBarExtraStyle(.window) entsteht
         // die Ansicht erst beim ersten Öffnen des Popovers.
-        DispatchQueue.main.async { Model.shared.startWatch() }
+        DispatchQueue.main.async {
+            Model.shared.startMonitorWatch()
+            Model.shared.startWatch()
+        }
     }
 
     var body: some Scene {

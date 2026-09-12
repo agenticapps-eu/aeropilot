@@ -16,16 +16,23 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-APP="$HOME/Applications/AeroPilot.app"
+DEST="$HOME/Applications/AeroPilot.app"
+mkdir -p "$HOME/Applications"
+STAGE="$(mktemp -d "$HOME/Applications/.aeropilot-build.XXXXXX")"
+APP="$STAGE/AeroPilot.app"
 BIN="$APP/Contents/MacOS/AeroPilot"
-
-command -v swiftc >/dev/null || { echo "swiftc fehlt — Xcode Command Line Tools?"; exit 1; }
-
-echo "▸ App läuft schon? Dann beenden"
-pkill -x AeroPilot 2>/dev/null && sleep 1 || true
-
-echo "▸ Bundle anlegen"
-rm -rf "$APP"
+BACKUP="$HOME/Applications/AeroPilot.previous.app"
+swapped=0
+recover() {
+  code=$?
+  if [ "$code" -ne 0 ] && [ "$swapped" -eq 1 ]; then
+    rm -rf "$DEST"
+    if [ -d "$BACKUP" ]; then mv "$BACKUP" "$DEST"; open "$DEST" || true; fi
+  fi
+  rm -rf "$STAGE"
+  exit "$code"
+}
+trap recover EXIT
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
@@ -49,7 +56,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 
 echo "▸ Kompilieren"
-swiftc -O \
+xcrun swiftc -O \
   -target arm64-apple-macos14 \
   -framework SwiftUI -framework AppKit -framework ServiceManagement \
   -parse-as-library \
@@ -57,16 +64,36 @@ swiftc -O \
   "$HERE/AeroPilot.swift"
 
 echo "▸ Ad-hoc signieren"
-codesign --force --deep --sign - "$APP" >/dev/null 2>&1 \
-  && echo "  signiert" || echo "  warn: codesign fehlgeschlagen (App läuft meist trotzdem)"
+codesign --force --deep --sign - "$APP"
+codesign --verify --deep --strict "$APP"
+plutil -lint "$APP/Contents/Info.plist"
 
-echo "▸ Fertig: $APP"
-ls -lh "$BIN" | awk '{print "  Binary:", $5}'
-
-if [ "${1:-}" != "--no-run" ]; then
-  echo "▸ Starten"
-  open "$APP"
-  sleep 2
-  pgrep -x AeroPilot >/dev/null && echo "  läuft — Icon in der Menüleiste (geteiltes Quadrat)" \
-                                || echo "  warn: nicht gestartet, siehe Console.app"
+if [ "${1:-}" = "--build-only" ]; then
+  mkdir -p "$HERE/build"
+  rm -rf "$HERE/build/AeroPilot.app"
+  mv "$APP" "$HERE/build/AeroPilot.app"
+  echo "Build geprüft: $HERE/build/AeroPilot.app (laufende App unverändert)"
+  exit 0
 fi
+
+# Compilation and signature validation completed before touching the running app.
+pkill -x AeroPilot 2>/dev/null || true
+for _ in {1..30}; do
+  pgrep -x AeroPilot >/dev/null || break
+  sleep 0.1
+done
+if pgrep -x AeroPilot >/dev/null; then
+  echo "AeroPilot läuft noch; Installation abgebrochen." >&2
+  exit 1
+fi
+rm -rf "$BACKUP"
+if [ -d "$DEST" ]; then mv "$DEST" "$BACKUP"; fi
+swapped=1
+mv "$APP" "$DEST"
+if [ "${1:-}" != "--no-run" ]; then
+  open "$DEST"
+  sleep 2
+  pgrep -x AeroPilot >/dev/null || { echo "Start fehlgeschlagen — vorherige App wiederherstellen." >&2; exit 1; }
+fi
+swapped=0
+echo "Installiert und geprüft: $DEST"

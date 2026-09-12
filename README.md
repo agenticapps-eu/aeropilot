@@ -24,7 +24,8 @@ sichtbares Fenster nicht kennt**, und wenn ein Fenster **nicht auf dem
 Workspace liegt, den `env/layout.conf` vorsieht** — siehe unten.
 
 **Workspaces** — Übersicht mit Monitor und Fensterzahl, Klick springt hin,
-`flatten` + `balance-sizes` pro Workspace.
+gleichmäßiges Verteilen der Größen ohne Auflösen verschachtelter Container.
+Nur der explizite Discover-Befehl aus aerospace-setup baut Desktop-Workspace 2 neu auf.
 
 **Config** — `aerospace.toml` im Editor. *Prüfen* validiert, ohne anzuwenden.
 *Speichern + anwenden* legt eine Sicherung an, validiert, und **rollt bei
@@ -175,3 +176,15 @@ deaktivieren; dann einmal im Bereich *App* nachschauen.
 ## Lizenz
 
 MIT
+
+## Sicheres Bauen und Monitorprofile
+
+`./build.sh --build-only` kompiliert und signiert nach build/AeroPilot.app ohne
+die laufende App anzufassen. `./build.sh` installiert erst nach erfolgreicher
+Prüfung und startet neu; bei Aktivierungsfehler wird AeroPilot.previous.app
+wiederhergestellt. `--no-run` installiert ohne Start.
+
+AeroPilot verwendet den Monitorhandler aus aerospace-setup und dessen atomaren
+Profilstatus Version 1. Fehlt der Handler, bleibt Reload als Rückfall erhalten.
+Die Regeln im Fenstercheck folgen dem aktiven Profil. Tests:
+`python3 tests/test_config_write.py` und `python3 tests/test_monitor_changes.py`.
