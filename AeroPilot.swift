@@ -408,6 +408,66 @@ final class Model: ObservableObject {
     let configPath = NSHomeDirectory() + "/.config/aerospace/aerospace.toml"
     let envDir     = NSHomeDirectory() + "/.config/aerospace/env"
 
+    // ── Workspace-Namen ───────────────────────────────────────────────
+    //
+    // AeroSpace kennt keine Namen: ein Workspace IST seine Kennung. Ihn
+    // umzubenennen hiesse, die Kennung ueberall mitzuziehen — Config,
+    // Tasten, layout.conf, Skriptnamen. Die Namen stehen deshalb daneben
+    // in env/workspaces.conf, rein zur Anzeige, und werden auch von den
+    // ws-*.sh fuer ihre Beschriftung gelesen.
+    @Published var wsNames: [String: String] = [:]
+
+    var workspacesConf: String { envDir + "/workspaces.conf" }
+
+    func loadWorkspaceNames() {
+        guard let text = try? String(contentsOfFile: workspacesConf, encoding: .utf8)
+        else { wsNames = [:]; return }
+        var out: [String: String] = [:]
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = raw.split(separator: "#", maxSplits: 1,
+                                 omittingEmptySubsequences: false)[0]
+                .trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty else { continue }
+            let parts = line.split(whereSeparator: \.isWhitespace)
+            guard parts.count >= 2 else { continue }
+            out[String(parts[0])] = parts.dropFirst().joined(separator: " ")
+        }
+        wsNames = out
+    }
+
+    func name(of ws: String) -> String { wsNames[ws] ?? "" }
+
+    /// Schreibt EINEN Namen zurueck. Zeilenweise ersetzen statt die Datei
+    /// neu zu erzeugen — der Kopf erklaert, warum es die Datei gibt, und
+    /// eine Neuerzeugung wuerde ihn wegwerfen.
+    func setWorkspaceName(_ ws: String, _ name: String) {
+        let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard var lines = (try? String(contentsOfFile: workspacesConf, encoding: .utf8))?
+            .components(separatedBy: "\n") else {
+            say("workspaces.conf nicht lesbar.", error: true); return
+        }
+        var replaced = false
+        for (i, raw) in lines.enumerated() {
+            let code = raw.split(separator: "#", maxSplits: 1,
+                                 omittingEmptySubsequences: false)[0]
+                .trimmingCharacters(in: .whitespaces)
+            guard let first = code.split(whereSeparator: \.isWhitespace).first,
+                  String(first) == ws else { continue }
+            lines[i] = clean.isEmpty ? "\(ws)" : "\(ws)  \(clean)"
+            replaced = true
+            break
+        }
+        if !replaced { lines.append("\(ws)  \(clean)") }
+        do {
+            try lines.joined(separator: "\n").write(toFile: workspacesConf,
+                                                    atomically: true, encoding: .utf8)
+            loadWorkspaceNames()
+            say("Workspace \(ws) heisst jetzt \(clean.isEmpty ? "(ohne Namen)" : clean).")
+        } catch {
+            say("Schreiben fehlgeschlagen: \(error)", error: true)
+        }
+    }
+
     private lazy var monitorChanges = MonitorChangeObserver(signature: {
         NSScreen.screens.map { screen in
             let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
@@ -506,6 +566,7 @@ final class Model: ObservableObject {
         findOrphans()
         findMisplaced()
         floats = persistentFloats()
+        loadWorkspaceNames()
     }
 
     // ── Soll-Ist-Abgleich ─────────────────────────────────────────────
@@ -900,6 +961,250 @@ final class Model: ObservableObject {
     }
 }
 
+// ── Fremde Konfigurationsdateien ──────────────────────────────────────
+// Ghostty und herdr bringen eigene Configs mit. AeroPilot fasst sie an,
+// aber nur zeilenweise.
+//
+// WARUM NICHT PARSEN UND NEU SCHREIBEN:
+// Beide Dateien bestehen zur Hälfte aus Kommentaren, und die tragen das
+// Warum — welche Taste wem gehört, welche Kollision wo lauert, was am
+// 02.09. rausgeflogen ist und weshalb. Ein TOML-Round-Trip wirft das
+// alles weg. Deshalb wird genau die eine Zeile ersetzt, die sich ändert,
+// und der Rest bleibt Byte für Byte stehen.
+
+enum AppConfig {
+    static let ghostty = NSHomeDirectory() + "/.config/ghostty/config"
+    static let herdr   = NSHomeDirectory() + "/.config/herdr/config.toml"
+    static let ghosttyBin = "/Applications/Ghostty.app/Contents/MacOS/ghostty"
+
+    static func read(_ path: String) -> String {
+        (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+    }
+
+    /// Vor jedem Schreiben eine datierte Kopie. Kostet nichts und hat
+    /// schon zweimal einen Abend gerettet.
+    private static func backup(_ path: String) {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd-HHmmss"
+        try? FileManager.default.copyItem(atPath: path,
+            toPath: path + ".bak." + f.string(from: Date()))
+    }
+
+    private static func write(_ path: String, _ text: String) -> Bool {
+        backup(path)
+        do { try text.write(toFile: path, atomically: true, encoding: .utf8); return true }
+        catch { return false }
+    }
+
+    /// Ghostty-Format: `schlüssel = wert`, eine Zeile je Eintrag.
+    /// Fehlt der Schlüssel, wird er hinten angehängt.
+    @discardableResult
+    static func setGhostty(_ key: String, _ value: String) -> Bool {
+        var lines = read(ghostty).components(separatedBy: "\n")
+        let neu = "\(key) = \(value)"
+        var gefunden = false
+        for (i, l) in lines.enumerated() {
+            let t = l.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix(key + " =") || t.hasPrefix(key + "=") {
+                lines[i] = neu; gefunden = true; break
+            }
+        }
+        if !gefunden {
+            if lines.last?.isEmpty == false { lines.append("") }
+            lines.append("# von AeroPilot gesetzt")
+            lines.append(neu)
+        }
+        return write(ghostty, lines.joined(separator: "\n"))
+    }
+
+    static func getGhostty(_ key: String) -> String {
+        for l in read(ghostty).components(separatedBy: "\n") {
+            let t = l.trimmingCharacters(in: .whitespaces)
+            guard !t.hasPrefix("#") else { continue }
+            if t.hasPrefix(key + " =") || t.hasPrefix(key + "=") {
+                return t.drop(while: { $0 != "=" }).dropFirst()
+                        .trimmingCharacters(in: .whitespaces)
+            }
+        }
+        return ""
+    }
+
+    /// TOML: Schlüssel INNERHALB eines Abschnitts ersetzen. Ohne die
+    /// Abschnittsgrenze würde `name` unter [theme] und ein `name`
+    /// woanders verwechselt.
+    @discardableResult
+    static func setToml(_ path: String, section: String, key: String, value: String) -> Bool {
+        var lines = read(path).components(separatedBy: "\n")
+        var drin = section.isEmpty
+        for (i, l) in lines.enumerated() {
+            let t = l.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("[") {
+                drin = (t == "[\(section)]")
+                continue
+            }
+            guard drin, !t.hasPrefix("#") else { continue }
+            if t.hasPrefix(key + " =") || t.hasPrefix(key + "=") {
+                lines[i] = "\(key) = \(value)"
+                return write(path, lines.joined(separator: "\n"))
+            }
+        }
+        return false
+    }
+
+    static func getToml(_ path: String, section: String, key: String) -> String {
+        var drin = section.isEmpty
+        for l in read(path).components(separatedBy: "\n") {
+            let t = l.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("[") { drin = (t == "[\(section)]"); continue }
+            guard drin, !t.hasPrefix("#") else { continue }
+            if t.hasPrefix(key + " =") || t.hasPrefix(key + "=") {
+                return t.drop(while: { $0 != "=" }).dropFirst()
+                        .trimmingCharacters(in: .whitespaces)
+                        .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            }
+        }
+        return ""
+    }
+
+    /// Themes und Fonts kommen aus Ghostty selbst — eine gepflegte Liste
+    /// im Code wäre am Tag des nächsten Ghostty-Updates falsch.
+    static func ghosttyThemes() -> [String] {
+        let r = Aero.shell("'\(ghosttyBin)' +list-themes 2>/dev/null")
+        return r.out.components(separatedBy: "\n")
+            .map { $0.replacingOccurrences(of: " (resources)", with: "")
+                     .replacingOccurrences(of: " (user)", with: "")
+                     .trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
+    static func ghosttyFonts() -> [String] {
+        let r = Aero.shell("'\(ghosttyBin)' +list-fonts 2>/dev/null")
+        // Ghostty listet Familie und darunter eingerückt die Schnitte.
+        // Uns interessiert nur die Familie: die nicht eingerückten Zeilen.
+        return r.out.components(separatedBy: "\n")
+            .filter { !$0.isEmpty && !$0.hasPrefix(" ") && !$0.hasPrefix("\t") }
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+}
+
+// ── Tastenkürzel aller drei Werkzeuge ─────────────────────────────────
+
+enum Tool: String, CaseIterable {
+    case aerospace = "AeroSpace"
+    case ghostty   = "Ghostty"
+    case herdr     = "herdr"
+
+    var tint: Color {
+        switch self {
+        case .aerospace: return .blue
+        case .ghostty:   return .green
+        // Pink statt Orange: Orange gehört den Aktionen, und im
+        // Cheatsheet stehen herdr-Kürzel direkt neben Aktionsfarben.
+        case .herdr:     return .pink
+        }
+    }
+    var icon: String {
+        switch self {
+        case .aerospace: return "square.grid.2x2.fill"
+        case .ghostty:   return "terminal.fill"
+        case .herdr:     return "rectangle.split.3x1.fill"
+        }
+    }
+}
+
+struct Shortcut: Identifiable {
+    let id = UUID()
+    let keys: String
+    let what: String
+    let tool: Tool
+    let wichtig: Bool
+}
+
+enum Shortcuts {
+    /// Was „wichtig" heisst, ist eine Entscheidung, keine Messung: es
+    /// sind die Kürzel, die man im Alltag tatsächlich drückt. Alles
+    /// andere ist vollständig, aber steht hinter „mehr …" — eine Liste
+    /// aus 100 Zeilen liest niemand.
+    private static let wichtigAero: Set<String> = [
+        "alt-1","alt-2","alt-3","alt-4","alt-5","alt-6","alt-7","alt-tab",
+        "alt-ctrl-a","alt-ctrl-m","alt-ctrl-w","alt-ctrl-r",
+        "ctrl-left","ctrl-right","alt-left","alt-right","alt-up","alt-down",
+    ]
+    private static let wichtigHerdr: Set<String> = [
+        "prefix","new_workspace","next_workspace","previous_workspace",
+        "next_tab","previous_tab","new_tab","split_vertical",
+        "split_horizontal","zoom","close_pane",
+    ]
+
+    static func all() -> [Shortcut] { aerospace() + ghostty() + herdr() }
+
+    // AeroSpace: aus [mode.main.binding], Zeilen `taste = 'befehl'`
+    static func aerospace() -> [Shortcut] {
+        let text = AppConfig.read(NSHomeDirectory() + "/.config/aerospace/aerospace.toml")
+        var out: [Shortcut] = []
+        var drin = false
+        for raw in text.components(separatedBy: "\n") {
+            let t = raw.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("[") { drin = t.hasPrefix("[mode.main.binding]"); continue }
+            guard drin, !t.hasPrefix("#"), t.contains(" = ") else { continue }
+            let teile = t.components(separatedBy: " = ")
+            guard teile.count >= 2 else { continue }
+            let taste = teile[0].trimmingCharacters(in: .whitespaces)
+            var was = teile.dropFirst().joined(separator: " = ")
+                .trimmingCharacters(in: CharacterSet(charactersIn: "'\" "))
+            was = was.replacingOccurrences(of: "exec-and-forget ", with: "")
+            if let r = was.range(of: "/", options: .backwards) { was = String(was[r.upperBound...]) }
+            out.append(Shortcut(keys: taste, what: was, tool: .aerospace,
+                                wichtig: wichtigAero.contains(taste)))
+        }
+        return out
+    }
+
+    // Ghostty: `keybind = kombination=aktion`. `=unbind` ist kein Kürzel,
+    // sondern das Abschalten eines mitgelieferten — raus damit.
+    static func ghostty() -> [Shortcut] {
+        var out: [Shortcut] = []
+        for raw in AppConfig.read(AppConfig.ghostty).components(separatedBy: "\n") {
+            let t = raw.trimmingCharacters(in: .whitespaces)
+            guard t.hasPrefix("keybind"), let eq = t.firstIndex(of: "=") else { continue }
+            let rest = String(t[t.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+            guard let sep = rest.firstIndex(of: "="), !rest.hasSuffix("=unbind") else { continue }
+            let kombi = String(rest[..<sep]).trimmingCharacters(in: .whitespaces)
+            var aktion = String(rest[rest.index(after: sep)...]).trimmingCharacters(in: .whitespaces)
+            // `text:\x02h` ist die an herdr getippte Prefix-Sequenz.
+            if aktion.hasPrefix("text:") { aktion = "an herdr: " + aktion.replacingOccurrences(of: "text:", with: "") }
+            out.append(Shortcut(keys: kombi, what: aktion, tool: .ghostty,
+                                wichtig: kombi.contains("ctrl+alt+shift+super")))
+        }
+        return out
+    }
+
+    // herdr: [keys]-Abschnitt, Wert ist String oder Liste.
+    static func herdr() -> [Shortcut] {
+        var out: [Shortcut] = []
+        var drin = false
+        for raw in AppConfig.read(AppConfig.herdr).components(separatedBy: "\n") {
+            let t = raw.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("[") { drin = (t == "[keys]"); continue }
+            guard drin, !t.hasPrefix("#"), t.contains("=") else { continue }
+            let teile = t.components(separatedBy: "=")
+            let name = teile[0].trimmingCharacters(in: .whitespaces)
+            var wert = teile.dropFirst().joined(separator: "=").trimmingCharacters(in: .whitespaces)
+            wert = wert.replacingOccurrences(of: "[", with: "")
+                       .replacingOccurrences(of: "]", with: "")
+                       .replacingOccurrences(of: "\"", with: "")
+            let kombis = wert.components(separatedBy: ",")
+                             .map { $0.trimmingCharacters(in: .whitespaces) }
+                             .filter { !$0.isEmpty }
+            guard !kombis.isEmpty else { continue }
+            out.append(Shortcut(keys: kombis.joined(separator: "  ·  "),
+                                what: name.replacingOccurrences(of: "_", with: " "),
+                                tool: .herdr, wichtig: wichtigHerdr.contains(name)))
+        }
+        return out
+    }
+}
+
 // ── Aussehen ──────────────────────────────────────────────────────────
 // Eine Menüleisten-App wird im Vorbeigehen benutzt. Farbe und Symbol
 // sind deshalb kein Zierrat: sie sind der schnellste Weg, eine Zeile zu
@@ -997,21 +1302,21 @@ struct ActionRow: View {
 /// Taste und nicht als Teil des Satzes.
 struct Keycap: View {
     let text: String
+    /// Farbe des Werkzeugs, zu dem das Kürzel gehört. Graue Kappen über
+    /// drei Werkzeuge hinweg sehen aus wie eine einzige lange Liste —
+    /// die Farbe sagt auf einen Blick, wer die Taste abfängt.
+    var tint: Color = .secondary
     var body: some View {
         Text(text.replacingOccurrences(of: "alt-", with: "⌥")
                  .replacingOccurrences(of: "ctrl-", with: "⌃")
                  .replacingOccurrences(of: "shift-", with: "⇧")
                  .replacingOccurrences(of: "cmd-", with: "⌘"))
-            .font(.system(size: 10, weight: .medium, design: .rounded))
-            .foregroundStyle(.secondary)
+            .font(.system(size: 10, weight: .bold, design: .rounded))
+            .foregroundStyle(tint)
             .padding(.horizontal, 6).padding(.vertical, 2)
             .background(
                 RoundedRectangle(cornerRadius: 5, style: .continuous)
-                    .fill(Color.primary.opacity(0.07))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 5, style: .continuous)
-                            .strokeBorder(Color.primary.opacity(0.10), lineWidth: 0.5)
-                    )
+                    .fill(tint.opacity(0.18))
             )
     }
 }
@@ -1042,38 +1347,67 @@ struct RootView: View {
     @AppStorage(Pref.startTab)    private var startTab = 0
     @AppStorage(Pref.panelHeight) private var panelHeight = 380.0
 
-    private let tabs: [(String, String)] = [
-        ("Fenster",    "macwindow"),
-        ("Workspaces", "square.grid.2x2"),
-        ("Config",     "doc.text"),
-        ("Aktionen",   "bolt.fill"),
-        ("App",        "gearshape"),
+    /// Acht Bereiche passen in keine Reiterleiste — fünf Textschnipsel
+    /// waren schon eng. Deshalb eine Leiste an der Seite: sie wächst
+    /// nach unten statt in die Breite, und jeder Bereich behält seine
+    /// eigene Farbe, die sich im Seitenkopf wiederholt.
+    /// Acht eigene Farben, keine doppelt. Zwei Seiten in derselben Farbe
+    /// heben die Farbcodierung auf — dann ist Farbe nur noch Dekoration
+    /// und sagt nicht mehr, wo man ist.
+    private let tabs: [(String, String, Color)] = [
+        ("Fenster",    "macwindow",                  .blue),
+        ("Workspaces", "square.grid.2x2.fill",       .cyan),
+        ("Aktionen",   "bolt.fill",                  .orange),
+        ("Kürzel",     "keyboard.fill",              .purple),
+        ("Ghostty",    "terminal.fill",              .green),
+        ("herdr",      "rectangle.split.3x1.fill",   .pink),
+        ("AeroSpace",  "doc.text.fill",              .indigo),
+        ("App",        "gearshape.fill",             .brown),
     ]
 
     var body: some View {
         VStack(spacing: 0) {
             header
-            tabBar
-
             Divider().opacity(0.5)
 
-            Group {
-                switch tab {
-                case 0: WindowsView(m: m)
-                case 1: WorkspacesView(m: m)
-                case 2: ConfigView(m: m)
-                case 3: ActionsView(m: m)
-                default: SettingsView(m: m)
+            HStack(spacing: 0) {
+                rail
+                Divider().opacity(0.4)
+                Group {
+                    switch tab {
+                    case 0: WindowsView(m: m)
+                    case 1: WorkspacesView(m: m)
+                    case 2: ActionsView(m: m)
+                    case 3: CheatsheetView(m: m)
+                    case 4: GhosttyView(m: m)
+                    case 5: HerdrView(m: m)
+                    case 6: ConfigView(m: m)
+                    default: SettingsView(m: m)
+                    }
                 }
+                .frame(maxWidth: .infinity)
             }
             .frame(height: panelHeight)
 
             Divider().opacity(0.5)
             StatusBar(m: m)
         }
-        .frame(width: 560)
+        .frame(width: 660)
         .background(.ultraThinMaterial)
-        .onAppear { tab = startTab; m.refresh() }
+        .onAppear { tab = min(startTab, tabs.count - 1); m.refresh() }
+    }
+
+    private var rail: some View {
+        VStack(spacing: 2) {
+            ForEach(Array(tabs.enumerated()), id: \.offset) { i, t in
+                RailButton(title: t.0, icon: t.1, tint: t.2, selected: tab == i) {
+                    tab = i
+                }
+            }
+            Spacer()
+        }
+        .padding(.vertical, 8).padding(.horizontal, 6)
+        .frame(width: 104)
     }
 
     /// Kopfzeile: wer bin ich, und wie steht es gerade. Die Marken rechts
@@ -1083,10 +1417,20 @@ struct RootView: View {
     private var header: some View {
         HStack(spacing: 8) {
             Image(systemName: "square.split.2x2.fill")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.tint)
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(.white)
+                .frame(width: 22, height: 22)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(LinearGradient(colors: [.blue, .purple],
+                                             startPoint: .topLeading,
+                                             endPoint: .bottomTrailing))
+                )
             Text("AeroPilot")
-                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .font(.system(size: 14, weight: .bold, design: .rounded))
+                .foregroundStyle(
+                    LinearGradient(colors: [.blue, .purple],
+                                   startPoint: .leading, endPoint: .trailing))
             Spacer()
             if !m.orphans.isEmpty {
                 Pill(icon: "exclamationmark.triangle.fill",
@@ -1103,40 +1447,52 @@ struct RootView: View {
         .padding(.bottom, 8)
     }
 
-    /// Eigene Reiterleiste statt Segmented Control: Symbole sind auf
-    /// einen Blick unterscheidbar, fünf Textschnipsel nicht.
-    private var tabBar: some View {
-        HStack(spacing: 2) {
-            ForEach(Array(tabs.enumerated()), id: \.offset) { i, t in
-                TabButton(title: t.0, icon: t.1, selected: tab == i) {
-                    tab = i
-                }
-            }
-        }
-        .padding(.horizontal, 8)
-        .padding(.bottom, 8)
-    }
 }
 
-struct TabButton: View {
+/// Eintrag der Seitenleiste. Der aktive bekommt Farbe UND einen Balken
+/// links — Farbe allein ist zu schwach, wenn direkt daneben eine zweite
+/// Farbe steht, und ein Balken funktioniert auch bei Farbenblindheit.
+struct RailButton: View {
     let title: String
     let icon: String
+    let tint: Color
     let selected: Bool
     let action: () -> Void
     @State private var hovering = false
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 5) {
-                Image(systemName: icon).font(.system(size: 11, weight: .semibold))
-                Text(title).font(.system(size: 11, weight: selected ? .semibold : .regular))
+            HStack(spacing: 8) {
+                // Das Symbol trägt die Farbe immer, auch unausgewählt —
+                // dadurch ist die Leiste als Ganzes farbig und man findet
+                // eine Seite am Farbton wieder, nicht erst am Text.
+                Image(systemName: icon)
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(selected ? AnyShapeStyle(.white)
+                                              : AnyShapeStyle(tint))
+                    .frame(width: 20, height: 20)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(selected ? AnyShapeStyle(
+                                    LinearGradient(colors: [tint,
+                                                            tint.opacity(0.72)],
+                                                   startPoint: .top,
+                                                   endPoint: .bottom))
+                                  : AnyShapeStyle(tint.opacity(0.16)))
+                    )
+                Text(title)
+                    .font(.system(size: 11,
+                                  weight: selected ? .bold : .medium,
+                                  design: .rounded))
+                    .foregroundStyle(selected ? AnyShapeStyle(tint)
+                                              : AnyShapeStyle(.secondary))
+                    .lineLimit(1)
+                Spacer(minLength: 0)
             }
-            .foregroundStyle(selected ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
-            .padding(.horizontal, 9).padding(.vertical, 5)
-            .frame(maxWidth: .infinity)
+            .padding(.vertical, 4).padding(.leading, 5).padding(.trailing, 6)
             .background(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(selected ? Color.accentColor.opacity(0.15)
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(selected ? tint.opacity(0.16)
                                    : Color.primary.opacity(hovering ? 0.06 : 0))
             )
             .contentShape(Rectangle())
@@ -1156,30 +1512,68 @@ struct WindowsView: View {
     }
 
     var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 2) {
-                if !m.orphans.isEmpty { OrphanBanner(m: m) }
-                if !m.misplaced.isEmpty { MisplacedBanner(m: m) }
-                ForEach(grouped, id: \.0) { ws, wins in
-                    HStack(spacing: 6) {
-                        Text("Workspace \(ws)").font(.caption).bold()
-                        if ws == m.focused {
-                            Text("aktiv").font(.caption2)
-                                .padding(.horizontal, 4).padding(.vertical, 1)
-                                .background(Color.accentColor.opacity(0.2))
-                                .clipShape(Capsule())
-                        }
-                        Spacer()
-                        Button("ausgleichen") { m.balance(ws) }
-                            .buttonStyle(.link).font(.caption2)
+        VStack(spacing: 0) {
+            PageHeader(icon: "macwindow", title: "Fenster",
+                       subtitle: m.windows.count == 1
+                           ? "1 offen" : "\(m.windows.count) offen",
+                       tint: .blue)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    if !m.orphans.isEmpty { OrphanBanner(m: m) }
+                    if !m.misplaced.isEmpty { MisplacedBanner(m: m) }
+                    ForEach(grouped, id: \.0) { ws, wins in
+                        // Name dazu, wenn einer in workspaces.conf steht —
+                        // „Workspace 5 · HOMELAB" liest sich schneller als
+                        // eine blosse Nummer.
+                        GroupHeader(title: m.name(of: ws).isEmpty
+                                        ? "Workspace \(ws)"
+                                        : "Workspace \(ws) · \(m.name(of: ws))",
+                                    count: wins.count,
+                                    active: ws == m.focused,
+                                    action: ("ausgleichen", { m.balance(ws) }))
+                        ForEach(wins) { w in WindowRow(m: m, w: w) }
                     }
-                    .padding(.horizontal, 10).padding(.top, 8)
-
-                    ForEach(wins) { w in WindowRow(m: m, w: w) }
                 }
+                .padding(.bottom, 10)
             }
-            .padding(.bottom, 8)
         }
+    }
+}
+
+/// Zwischenüberschrift in der Liste: klein, gesperrt, versalisiert, mit
+/// einer Linie bis zum Rand. Sie soll die Liste gliedern, ohne sich wie
+/// ein weiterer Eintrag zu lesen — deshalb kleiner als die Einträge
+/// darunter, nicht grösser.
+struct GroupHeader: View {
+    let title: String
+    var count: Int? = nil
+    var active: Bool = false
+    var action: (String, () -> Void)? = nil
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(title.uppercased())
+                .font(.system(size: 9, weight: .bold, design: .rounded))
+                .foregroundStyle(active ? AnyShapeStyle(Color.blue)
+                                        : AnyShapeStyle(.secondary))
+                .kerning(0.6)
+            if active {
+                Circle().fill(Color.blue).frame(width: 5, height: 5)
+            }
+            if let count {
+                Text("\(count)")
+                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.tertiary)
+            }
+            Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 1)
+            if let action {
+                Button(action.0, action: action.1)
+                    .buttonStyle(.plain)
+                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 16).padding(.top, 12).padding(.bottom, 3)
     }
 }
 
@@ -1335,29 +1729,111 @@ struct WorkspacesView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 4) {
-                ForEach(shown) { ws in
-                    let n = m.windows.filter { $0.workspace == ws.workspace }.count
-                    HStack {
-                        Button("Workspace \(ws.workspace)") {
-                            m.focus(workspace: ws.workspace)
-                        }
-                        .buttonStyle(.link)
-                        .font(.system(size: 12,
-                              weight: ws.workspace == m.focused ? .bold : .regular))
-                        Text(ws.monitorName).font(.caption).foregroundStyle(.secondary)
-                        Spacer()
-                        Text("\(n) Fenster").font(.caption).foregroundStyle(.secondary)
-                        Button("ausgleichen") { m.balance(ws.workspace) }
-                            .buttonStyle(.link).font(.caption2)
+        VStack(spacing: 0) {
+            PageHeader(icon: "square.grid.2x2.fill", title: "Workspaces",
+                       subtitle: "aktiv: \(m.focused)", tint: .cyan)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(shown) { ws in
+                        let n = m.windows.filter { $0.workspace == ws.workspace }.count
+                        let aktiv = ws.workspace == m.focused
+                        // FRÜHER war die ganze Zeile ein Button. Das geht
+                        // nicht mehr: ein TextField in einem Button bekommt
+                        // auf macOS keine Klicks — der Button schluckt sie.
+                        // Jetzt ist die Scheibe der Knopf zum Hinspringen,
+                        // der Name ein Feld, und die Unterzeile reagiert per
+                        // Tippgeste.
+                        HStack(spacing: 10) {
+                                // Nummer als gefüllte Scheibe — sie ist die
+                                // Kennung des Workspace und soll wie eine
+                                // Marke aussehen, nicht wie Fliesstext.
+                                Button { m.focus(workspace: ws.workspace) } label: {
+                                    Text(ws.workspace)
+                                        .font(.system(size: 13, weight: .heavy,
+                                                      design: .rounded))
+                                        .foregroundStyle(aktiv ? AnyShapeStyle(.white)
+                                                               : AnyShapeStyle(Color.cyan))
+                                        .frame(width: 26, height: 26)
+                                        .background(
+                                            Circle().fill(aktiv
+                                                ? AnyShapeStyle(LinearGradient(
+                                                    colors: [.cyan, .blue],
+                                                    startPoint: .topLeading,
+                                                    endPoint: .bottomTrailing))
+                                                : AnyShapeStyle(Color.cyan.opacity(0.18)))
+                                        )
+                                }
+                                .buttonStyle(.plain)
+                                .help("Workspace \(ws.workspace) anzeigen")
+                                VStack(alignment: .leading, spacing: 1) {
+                                    // Name aus env/workspaces.conf, direkt
+                                    // hier aenderbar. Ein TextField statt
+                                    // Text, damit man nicht erst in einen
+                                    // Bearbeitungsmodus klicken muss.
+                                    WorkspaceNameField(m: m, ws: ws.workspace)
+                                    Text("\(ws.monitorName) · "
+                                         + (n == 1 ? "1 Fenster" : "\(n) Fenster"))
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                if n > 1 {
+                                    Button("ausgleichen") { m.balance(ws.workspace) }
+                                        .buttonStyle(.plain)
+                                        .font(.system(size: 10, weight: .semibold,
+                                                      design: .rounded))
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .padding(.horizontal, 10).padding(.vertical, 7)
+                            .background(
+                                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                    .fill(aktiv
+                                        ? AnyShapeStyle(LinearGradient(
+                                            colors: [Color.cyan.opacity(0.26),
+                                                     Color.blue.opacity(0.12)],
+                                            startPoint: .leading,
+                                            endPoint: .trailing))
+                                        : AnyShapeStyle(Color.cyan.opacity(0.07)))
+                            )
+                        .padding(.horizontal, 16)
                     }
-                    .padding(.horizontal, 12).padding(.vertical, 3)
-                    Divider()
                 }
+                .padding(.bottom, 12)
             }
-            .padding(.top, 8)
         }
+    }
+}
+
+/// Der Workspace-Name als Eingabefeld.
+///
+/// Eigener View, weil jede Zeile ihren eigenen Bearbeitungsstand braucht.
+/// Lokal gehalten und erst bei Enter oder beim Verlassen geschrieben —
+/// bei jedem Tastendruck in die Datei zu schreiben hiesse, dass ein
+/// halbgetippter Name durch refresh() wieder zurueckspringt.
+struct WorkspaceNameField: View {
+    @ObservedObject var m: Model
+    let ws: String
+    @State private var text = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        TextField("ohne Namen", text: $text)
+            .textFieldStyle(.plain)
+            .font(.system(size: 12, weight: .medium))
+            .focused($focused)
+            .onSubmit { commit() }
+            .onChange(of: focused) { if !focused { commit() } }
+            .onAppear { text = m.name(of: ws) }
+            // Von aussen geaenderte Datei uebernehmen, aber nur solange
+            // gerade niemand in diesem Feld tippt.
+            .onChange(of: m.wsNames) { if !focused { text = m.name(of: ws) } }
+    }
+
+    private func commit() {
+        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard clean != m.name(of: ws) else { return }
+        m.setWorkspaceName(ws, clean)
     }
 }
 
@@ -1367,14 +1843,22 @@ struct ConfigView: View {
     @State private var loaded = false
 
     var body: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 8) {
+            PageHeader(icon: "doc.text.fill", title: "AeroSpace",
+                       subtitle: "aerospace.toml", tint: .indigo)
+            // Weiche Fläche statt Rahmen — derselbe Griff wie bei Card.
             TextEditor(text: $text)
                 .font(.system(size: 11, design: .monospaced))
-                .border(Color.secondary.opacity(0.3))
-                .padding(.horizontal, 8)
+                .scrollContentBackground(.hidden)
+                .padding(8)
+                .background(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(Color.indigo.opacity(0.08))
+                )
+                .padding(.horizontal, 16)
 
-            HStack {
-                Button("Neu laden aus Datei") { text = m.loadConfig() }
+            HStack(spacing: 8) {
+                Button("Neu laden") { text = m.loadConfig() }
                 Button("Prüfen") {
                     let v = m.validate()
                     m.say(v.message, error: !v.ok)
@@ -1384,7 +1868,8 @@ struct ConfigView: View {
                     .keyboardShortcut("s")
                     .buttonStyle(.borderedProminent)
             }
-            .padding(.horizontal, 8).padding(.bottom, 6)
+            .controlSize(.small)
+            .padding(.horizontal, 16).padding(.bottom, 10)
         }
         .onAppear { if !loaded { text = m.loadConfig(); loaded = true } }
     }
@@ -1394,6 +1879,11 @@ struct ActionsView: View {
     @ObservedObject var m: Model
 
     var body: some View {
+        VStack(spacing: 0) {
+        PageHeader(icon: "bolt.fill", title: "Aktionen",
+                   subtitle: m.scripts.isEmpty
+                       ? "keine Skripte" : "\(m.scripts.count) Skripte",
+                   tint: .orange)
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 ForEach(m.scriptGroups, id: \.0) { group, scripts in
@@ -1432,7 +1922,8 @@ struct ActionsView: View {
                 Text(m.version).font(.caption2).foregroundStyle(.tertiary)
                     .padding(.horizontal, 14)
             }
-            .padding(.vertical, 12)
+            .padding(.bottom, 12)
+        }
         }
     }
 
@@ -1456,6 +1947,390 @@ struct ActionsView: View {
             .padding(.bottom, 1)
             VStack(spacing: 1) { c() }.padding(.horizontal, 6)
         }
+    }
+}
+
+// ── Bausteine für die Seiten ──────────────────────────────────────────
+
+/// Seitenkopf im Stil einer Zeitschriftenüberschrift: gross, fett, und
+/// der erklärende Teil daneben in Grau. Ein Titel, der in derselben
+/// Grösse wie der Inhalt steht, ist keine Überschrift, sondern nur eine
+/// weitere Zeile.
+struct PageHeader: View {
+    let icon: String
+    let title: String
+    let subtitle: String
+    let tint: Color
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            // Die Überschrift selbst trägt die Farbe, im Verlauf von
+            // kräftig nach weich. Ein schwarzer Titel mit farbiger
+            // Beizeile wirkt wie ein Formular; ein farbiger Titel setzt
+            // den Ton für die ganze Seite.
+            Text(title)
+                .font(.system(size: 24, weight: .heavy, design: .rounded))
+                .foregroundStyle(
+                    LinearGradient(colors: [tint, tint.opacity(0.62)],
+                                   startPoint: .leading, endPoint: .trailing))
+            Text(subtitle)
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .foregroundStyle(tint.opacity(0.85))
+                .padding(.horizontal, 7).padding(.vertical, 2)
+                .background(Capsule().fill(tint.opacity(0.16)))
+            Spacer()
+        }
+        .padding(.horizontal, 18).padding(.top, 14).padding(.bottom, 10)
+        // Farbe läuft nach unten aus, statt an einer Linie abzubrechen.
+        .background(
+            LinearGradient(colors: [tint.opacity(0.16), tint.opacity(0.0)],
+                           startPoint: .top, endPoint: .bottom)
+        )
+    }
+}
+
+/// Weich gefüllter Block ohne Rahmen. Dünne Linien zerhacken eine
+/// kleine Fläche in Kästchen; eine flächige Füllung gruppiert genauso
+/// zuverlässig und bleibt ruhig.
+struct Card<C: View>: View {
+    var tint: Color = .secondary
+    @ViewBuilder let content: () -> C
+    var body: some View {
+        HStack(spacing: 0) {
+            // Farbiger Streifen an der Kante: er gibt dem Block eine
+            // kräftige Farbe, ohne dass die ganze Fläche laut wird und
+            // der Text darauf schlechter lesbar würde.
+            Rectangle().fill(tint).frame(width: 3)
+            VStack(alignment: .leading, spacing: 10) { content() }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(14)
+        }
+        .background(
+            LinearGradient(colors: [tint.opacity(0.20), tint.opacity(0.09)],
+                           startPoint: .topLeading, endPoint: .bottomTrailing)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .padding(.horizontal, 16)
+    }
+}
+
+/// Suchfeld im Stil der Kalender-App: nur Lupe und Linie, kein Kasten.
+struct SearchField: View {
+    let placeholder: String
+    @Binding var text: String
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+            TextField(placeholder, text: $text)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+            if !text.isEmpty {
+                Button { text = "" } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 11)).foregroundStyle(.tertiary)
+                }.buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .background(Capsule().fill(Color.primary.opacity(0.06)))
+    }
+}
+
+/// Beschriftung links, Bedienelement rechts.
+struct FieldRow<C: View>: View {
+    let label: String
+    var hint: String? = nil
+    @ViewBuilder let control: () -> C
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(label).font(.system(size: 12, weight: .medium))
+                if let hint { Text(hint).font(.system(size: 10)).foregroundStyle(.secondary) }
+            }
+            .frame(width: 150, alignment: .leading)
+            control()
+            Spacer(minLength: 0)
+        }
+    }
+}
+
+// ── Ghostty ───────────────────────────────────────────────────────────
+
+struct GhosttyView: View {
+    @ObservedObject var m: Model
+    @State private var font = ""
+    @State private var size = ""
+    @State private var theme = ""
+    @State private var themes: [String] = []
+    @State private var fonts: [String] = []
+    @State private var geladen = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                PageHeader(icon: "terminal.fill", title: "Ghostty",
+                           subtitle: "~/.config/ghostty/config", tint: Tool.ghostty.tint)
+
+                Card(tint: Tool.ghostty.tint) {
+                    FieldRow(label: "Schriftfamilie",
+                             hint: fonts.isEmpty ? nil : "\(fonts.count) verfügbar") {
+                        Picker("", selection: $font) {
+                            Text("— Ghostty-Standard —").tag("")
+                            ForEach(fonts, id: \.self) { Text($0).tag($0) }
+                        }.labelsHidden().frame(width: 230)
+                    }
+                    FieldRow(label: "Schriftgrösse") {
+                        TextField("z. B. 13", text: $size)
+                            .textFieldStyle(.roundedBorder).frame(width: 80)
+                    }
+                    FieldRow(label: "Theme",
+                             hint: themes.isEmpty ? nil : "\(themes.count) verfügbar") {
+                        Picker("", selection: $theme) {
+                            Text("— Ghostty-Standard —").tag("")
+                            ForEach(themes, id: \.self) { Text($0).tag($0) }
+                        }.labelsHidden().frame(width: 230)
+                    }
+                    HStack {
+                        Spacer()
+                        Button("Speichern") { speichern() }
+                            .buttonStyle(.borderedProminent).controlSize(.small)
+                    }
+                }
+
+                Text("""
+                     Ghostty liest die Datei bei jedem Start neu. Offene \
+                     Fenster übernehmen Änderungen erst nach einem Neustart \
+                     der App. Vor jedem Speichern legt AeroPilot eine \
+                     datierte Kopie an.
+                     """)
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                    .padding(.horizontal, 14)
+
+                Text("Tastenkürzel stehen unter „Kürzel“ — dort alle drei Werkzeuge nebeneinander.")
+                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+                    .padding(.horizontal, 14).padding(.bottom, 10)
+            }
+        }
+        .onAppear {
+            guard !geladen else { return }
+            geladen = true
+            font  = AppConfig.getGhostty("font-family")
+            size  = AppConfig.getGhostty("font-size")
+            theme = AppConfig.getGhostty("theme")
+            DispatchQueue.global().async {
+                let t = AppConfig.ghosttyThemes(); let f = AppConfig.ghosttyFonts()
+                DispatchQueue.main.async { themes = t; fonts = f }
+            }
+        }
+    }
+
+    private func speichern() {
+        var n = 0
+        if !font.isEmpty  { AppConfig.setGhostty("font-family", font); n += 1 }
+        if !size.isEmpty  { AppConfig.setGhostty("font-size", size);   n += 1 }
+        if !theme.isEmpty { AppConfig.setGhostty("theme", theme);      n += 1 }
+        m.say(n == 0 ? "Nichts zu speichern" : "Ghostty: \(n) Einstellung(en) gespeichert")
+    }
+}
+
+// ── herdr ─────────────────────────────────────────────────────────────
+
+struct HerdrView: View {
+    @ObservedObject var m: Model
+    @State private var theme = ""
+    @State private var prefix = ""
+    @State private var geladen = false
+
+    /// Nur die Themes, die herdr mitbringt. Eine freie Texteingabe hier
+    /// wäre eine Einladung zum Vertippen, und ein falscher Name fällt
+    /// erst beim nächsten Start auf.
+    private let themen = ["kanagawa","catppuccin","dracula","gruvbox",
+                          "nord","tokyonight","solarized","rose-pine","default"]
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                PageHeader(icon: "rectangle.split.3x1.fill", title: "herdr",
+                           subtitle: "~/.config/herdr/config.toml", tint: Tool.herdr.tint)
+
+                Card(tint: Tool.herdr.tint) {
+                    FieldRow(label: "Theme") {
+                        Picker("", selection: $theme) {
+                            ForEach(themen, id: \.self) { Text($0).tag($0) }
+                        }.labelsHidden().frame(width: 200)
+                    }
+                    FieldRow(label: "Prefix-Taste",
+                             hint: "Basis aller prefix+… Kürzel") {
+                        TextField("ctrl+b", text: $prefix)
+                            .textFieldStyle(.roundedBorder).frame(width: 140)
+                    }
+                    HStack {
+                        Spacer()
+                        Button("Speichern") { speichern() }
+                            .buttonStyle(.borderedProminent).controlSize(.small)
+                    }
+                }
+
+                Card(tint: .red) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 12)).foregroundStyle(.red)
+                        Text("Prefix ändern zieht weit")
+                            .font(.system(size: 12, weight: .semibold))
+                    }
+                    Text("""
+                         Ghostty übersetzt die hyper-Anschläge in genau diese \
+                         Prefix-Sequenz — \\x02 ist ctrl+b. Änderst du den \
+                         Prefix hier, musst du die keybind-Zeilen in \
+                         ~/.config/ghostty/config mitziehen, sonst tippt \
+                         Ghostty ins Leere.
+                         """)
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+
+                Text("""
+                     Die übrigen Bindungen und die [[keys.command]]-Blöcke \
+                     bleiben bewusst der Datei vorbehalten: sie tragen \
+                     Kommentare, die erklären, welche Taste wem gehört und \
+                     wo es kollidiert. Ein Formular würde das wegwerfen.
+                     """)
+                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+                    .padding(.horizontal, 14).padding(.bottom, 10)
+            }
+        }
+        .onAppear {
+            guard !geladen else { return }
+            geladen = true
+            theme  = AppConfig.getToml(AppConfig.herdr, section: "theme", key: "name")
+            prefix = AppConfig.getToml(AppConfig.herdr, section: "keys",  key: "prefix")
+            if theme.isEmpty { theme = "default" }
+        }
+    }
+
+    private func speichern() {
+        var ok = 0
+        if AppConfig.setToml(AppConfig.herdr, section: "theme", key: "name",
+                             value: "\"\(theme)\"") { ok += 1 }
+        if !prefix.isEmpty,
+           AppConfig.setToml(AppConfig.herdr, section: "keys", key: "prefix",
+                             value: "\"\(prefix)\"") { ok += 1 }
+        m.say(ok == 0 ? "Nichts geändert" : "herdr: \(ok) Einstellung(en) gespeichert — herdr neu starten")
+    }
+}
+
+// ── Kürzel über alle drei Werkzeuge ───────────────────────────────────
+
+struct CheatsheetView: View {
+    @ObservedObject var m: Model
+    @State private var alle = false
+    @State private var filter: Tool? = nil
+    @State private var kuerzel: [Shortcut] = []
+    @State private var suche = ""
+
+    private var sichtbar: [Shortcut] {
+        kuerzel.filter { s in
+            // Beim Suchen zählt die Wichtig-Auswahl nicht mehr: wer
+            // tippt, will finden, nicht gefiltert werden.
+            let sichtbarkeit = alle || s.wichtig || !suche.isEmpty
+            let werkzeug = filter == nil || s.tool == filter
+            let treffer = suche.isEmpty
+                || s.keys.localizedCaseInsensitiveContains(suche)
+                || s.what.localizedCaseInsensitiveContains(suche)
+            return sichtbarkeit && werkzeug && treffer
+        }
+    }
+    private var proTool: [(Tool, [Shortcut])] {
+        Tool.allCases.compactMap { t in
+            let s = sichtbar.filter { $0.tool == t }
+            return s.isEmpty ? nil : (t, s)
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            PageHeader(icon: "keyboard.fill", title: "Tastenkürzel",
+                       subtitle: alle ? "alle \(kuerzel.count)" : "die wichtigsten",
+                       tint: .purple)
+
+            SearchField(placeholder: "Taste oder Aktion suchen …", text: $suche)
+                .padding(.horizontal, 18).padding(.bottom, 10)
+
+            HStack(spacing: 6) {
+                FilterChip(title: "Alle", tint: .secondary, active: filter == nil) { filter = nil }
+                ForEach(Tool.allCases, id: \.self) { t in
+                    FilterChip(title: t.rawValue, tint: t.tint, active: filter == t) { filter = t }
+                }
+                Spacer()
+                // Kein Schalter mit Beschriftung daneben — ein Knopf, der
+                // sagt, was er zeigt. „mehr …" ist der Zustand, den man
+                // will, nicht der, in dem man ist.
+                FilterChip(title: alle ? "weniger" : "mehr …",
+                           tint: .purple, active: alle) { alle.toggle() }
+            }
+            .padding(.horizontal, 18).padding(.bottom, 10)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(proTool, id: \.0) { tool, liste in
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 5) {
+                                Image(systemName: tool.icon)
+                                    .font(.system(size: 9, weight: .bold))
+                                    .foregroundStyle(tool.tint)
+                                Text(tool.rawValue.uppercased())
+                                    .font(.system(size: 9, weight: .bold, design: .rounded))
+                                    .foregroundStyle(tool.tint).kerning(0.6)
+                                Text("\(liste.count)")
+                                    .font(.system(size: 9)).foregroundStyle(.tertiary)
+                                Rectangle().fill(tool.tint.opacity(0.28)).frame(height: 1)
+                            }
+                            .padding(.horizontal, 14)
+                            ForEach(liste) { s in
+                                HStack(alignment: .top, spacing: 10) {
+                                    Keycap(text: s.keys, tint: tool.tint)
+                                        .frame(width: 170, alignment: .leading)
+                                    Text(s.what)
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(.primary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                    Spacer(minLength: 0)
+                                }
+                                .padding(.horizontal, 14).padding(.vertical, 2)
+                            }
+                        }
+                    }
+                    if sichtbar.isEmpty {
+                        Text("Keine Kürzel gefunden — stimmen die Pfade der Konfigurationsdateien?")
+                            .font(.caption).foregroundStyle(.secondary).padding(14)
+                    }
+                }
+                .padding(.vertical, 10)
+            }
+        }
+        .onAppear { if kuerzel.isEmpty { kuerzel = Shortcuts.all() } }
+    }
+}
+
+struct FilterChip: View {
+    let title: String
+    let tint: Color
+    let active: Bool
+    let action: () -> Void
+    @State private var hovering = false
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 10, weight: active ? .semibold : .regular))
+                .foregroundStyle(active ? tint : .secondary)
+                .padding(.horizontal, 8).padding(.vertical, 3)
+                .background(
+                    Capsule().fill(tint.opacity(active ? 0.16 : (hovering ? 0.08 : 0)))
+                )
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain).onHover { hovering = $0 }
     }
 }
 
@@ -1486,6 +2361,9 @@ struct SettingsView: View {
     @State private var mode = Autostart.mode
 
     var body: some View {
+        VStack(spacing: 0) {
+        PageHeader(icon: "gearshape.fill", title: "Einstellungen",
+                   subtitle: "AeroPilot", tint: .brown)
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
 
@@ -1599,7 +2477,8 @@ struct SettingsView: View {
                     Text(m.version).font(.caption2).foregroundStyle(.secondary)
                 }
             }
-            .padding(12)
+            .padding(.horizontal, 16).padding(.bottom, 12)
+        }
         }
         .onAppear {
             mode = Autostart.mode
@@ -1616,8 +2495,13 @@ struct SettingsView: View {
     }
 
     func group<C: View>(_ title: String, @ViewBuilder _ c: () -> C) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(title).font(.caption).bold().foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 6) {
+                Text(title.uppercased())
+                    .font(.system(size: 9, weight: .bold, design: .rounded))
+                    .foregroundStyle(.secondary).kerning(0.6)
+                Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 1)
+            }
             c()
         }
     }
@@ -1667,8 +2551,12 @@ struct StatusBar: View {
                 NSApplication.shared.terminate(nil)
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 9)
+        // Dunkles Band als Abschluss, wie die Ereignisliste im Kalender.
+        // Der Fuss trägt den Jetzt-Zustand; ein eigener Grund hebt ihn
+        // vom Inhalt ab, ohne dass es eine Trennlinie braucht.
+        .background(Color.primary.opacity(0.07))
     }
 }
 
