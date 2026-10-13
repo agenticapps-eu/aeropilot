@@ -353,6 +353,26 @@ struct Misplaced: Identifiable {
     var id: Int { windowId }
 }
 
+/// Ein Fenster, das floatet, obwohl keine einzige Regel in der
+/// aerospace.toml das verlangt.
+///
+/// WARUM ES DAS GIBT: zwischen dem 11. und 13.10.2026 sind dreimal
+/// Fenster unbemerkt auf `floating` gesprungen — erst Zen allein, dann
+/// ForkLift und Superhuman, zuletzt acht Stueck auf einmal nach einer
+/// Aenderung der Displayanordnung. Ein floatendes Fenster steht nicht im
+/// Kachelbaum: es laesst sich nicht stapeln, nicht tauschen, und
+/// relayout sortiert es zwar auf den richtigen Workspace, legt es dort
+/// aber nicht ins Raster. Von aussen sieht das nach "AeroSpace ist
+/// kaputt" aus. Die Ursache war jedesmal nur zu finden, weil jemand
+/// gezielt `window-layout` abgefragt hat.
+struct UnexpectedFloat: Identifiable {
+    let windowId: Int
+    let appName: String
+    let title: String
+    let workspace: String
+    var id: Int { windowId }
+}
+
 /// Eine Zeile aus env/layout.conf: Bundle-ID, Ziel-Workspace, optionales
 /// Titelmuster. Reihenfolge ist bedeutungstragend — erste Übereinstimmung
 /// gewinnt, wie bei on-window-detected.
@@ -401,6 +421,7 @@ final class Model: ObservableObject {
     @Published var scripts: [Script] = []
     @Published var orphans: [Orphan] = []
     @Published var misplaced: [Misplaced] = []
+    @Published var unexpectedFloats: [UnexpectedFloat] = []
     /// Bundle-IDs mit dauerhafter Float-Regel. Bei jedem refresh() frisch
     /// aus der Config gelesen — die Datei ist die Wahrheit, nicht die App.
     @Published var floats: Set<String> = []
@@ -566,6 +587,7 @@ final class Model: ObservableObject {
         findOrphans()
         findMisplaced()
         floats = persistentFloats()
+        findUnexpectedFloats()
         loadWorkspaceNames()
     }
 
@@ -573,26 +595,45 @@ final class Model: ObservableObject {
 
     /// Liest env/layout.conf — dieselbe Datei, die auch relayout.sh liest.
     /// Bewusst dieselbe: zwei Listen laufen auseinander, eine nicht.
+    ///
+    /// Seit 12.10.2026 mit Profil-Überlagerung, identisch zu layout.py:
+    /// `layout.<profil>.conf` wird VORANGESTELLT, nicht ersetzt. Die erste
+    /// passende Regel gewinnt, alles Übrige kommt weiter aus layout.conf.
+    /// Eine Profildatei mit `*`-Auffangfall (layout.laptop.conf) wirkt
+    /// dadurch weiterhin wie ein vollständiger Ersatz.
+    ///
+    /// WARUM DAS HIER STEHEN MUSS: AeroPilot wertet die Regeln selbst aus
+    /// statt layout.py zu rufen. Als layout.py das Profil `hybrid` bekam
+    /// und AeroPilot nicht, schob „alle einsortieren" iTerm wieder auf
+    /// Workspace 1 zurück — zwei Implementierungen derselben Regel, genau
+    /// der Fehler, den die eine Soll-Tabelle verhindern sollte.
     func layoutRules() -> [LayoutRule] {
         let statePath = NSHomeDirectory() + "/.local/state/aerospace/profile.json"
         let state = (try? Data(contentsOf: URL(fileURLWithPath: statePath)))
             .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-        let laptop = state?["version"] as? Int == 1 && state?["profile"] as? String == "laptop"
-        guard let text = try? String(contentsOfFile: envDir + (laptop ? "/layout.laptop.conf" : "/layout.conf"),
-                                     encoding: .utf8) else { return [] }
-        return text.split(separator: "\n").compactMap { raw in
-            let line = raw.split(separator: "#", maxSplits: 1,
-                                 omittingEmptySubsequences: false)[0]
-            let parts = line.split(whereSeparator: \.isWhitespace).map(String.init)
-            guard parts.count >= 2 else { return nil }
-            // Ein führendes `+` markiert Apps, die build-all.sh öffnet —
-            // für die Zuordnung selbst spielt es keine Rolle.
-            let bundle = parts[0].hasPrefix("+")
-                ? String(parts[0].dropFirst()) : parts[0]
-            return LayoutRule(bundleId: bundle, workspace: parts[1],
-                              titlePattern: parts.count > 2
-                                  ? parts[2...].joined(separator: " ") : nil)
+        let mode = state?["version"] as? Int == 1
+            ? state?["profile"] as? String : nil
+
+        func parse(_ file: String) -> [LayoutRule] {
+            guard let text = try? String(contentsOfFile: envDir + file, encoding: .utf8)
+            else { return [] }
+            return text.split(separator: "\n").compactMap { raw in
+                let line = raw.split(separator: "#", maxSplits: 1,
+                                     omittingEmptySubsequences: false)[0]
+                let parts = line.split(whereSeparator: \.isWhitespace).map(String.init)
+                guard parts.count >= 2 else { return nil }
+                // Ein führendes `+` markiert Apps, die build-all.sh öffnet —
+                // für die Zuordnung selbst spielt es keine Rolle.
+                let bundle = parts[0].hasPrefix("+")
+                    ? String(parts[0].dropFirst()) : parts[0]
+                return LayoutRule(bundleId: bundle, workspace: parts[1],
+                                  titlePattern: parts.count > 2
+                                      ? parts[2...].joined(separator: " ") : nil)
+            }
         }
+
+        let overrides = mode.map { parse("/layout.\($0).conf") } ?? []
+        return overrides + parse("/layout.conf")
     }
 
     func findMisplaced() {
@@ -615,6 +656,48 @@ final class Model: ObservableObject {
             }
             return nil                // keine Regel für diese App
         }
+    }
+
+    /// ALLE Bundle-IDs mit einer `layout floating`-Regel — egal wo in der
+    /// Config sie steht.
+    ///
+    /// Bewusst nicht `persistentFloats()`: das liest nur den
+    /// AeroPilot-Block. Die Hilfsfenster (Finder, Systemeinstellungen,
+    /// OBSBOT, Hazel, Boring Notch, Kontor) stehen absichtlich
+    /// AUSSERHALB davon, weil die App ihren Block komplett ersetzt. Wer
+    /// hier nur den Block liest, meldet genau diese Fenster faelschlich
+    /// als unerwartet floatend.
+    func allFloatRuleBundles() -> Set<String> {
+        var out = Set<String>()
+        for line in loadConfig().split(separator: "\n") {
+            guard line.contains("layout floating"),
+                  let r = line.range(of: "app-bundle-id} = ") else { continue }
+            let id = line[r.upperBound...].prefix {
+                !$0.isWhitespace && $0 != "'" && $0 != ","
+            }
+            if !id.isEmpty { out.insert(String(id)) }
+        }
+        return out
+    }
+
+    /// Fenster, die floaten, ohne dass eine Regel das verlangt.
+    func findUnexpectedFloats() {
+        let allowed = allFloatRuleBundles()
+        unexpectedFloats = windows.compactMap { w in
+            guard w.isFloating, !allowed.contains(w.appBundleId) else { return nil }
+            return UnexpectedFloat(windowId: w.windowId, appName: w.appName,
+                                   title: w.windowTitle, workspace: w.workspace)
+        }
+    }
+
+    /// Alle unerwartet floatenden Fenster zurueck in den Kachelbaum.
+    func fixUnexpectedFloats() {
+        let todo = unexpectedFloats
+        for f in todo {
+            Aero.run(["layout", "tiling", "--window-id", String(f.windowId)])
+        }
+        say("\(todo.count) Fenster wieder gekachelt.")
+        refresh()
     }
 
     /// Nur die abweichenden Fenster verschieben — kein flatten, kein
@@ -1520,6 +1603,7 @@ struct WindowsView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 2) {
                     if !m.orphans.isEmpty { OrphanBanner(m: m) }
+                    if !m.unexpectedFloats.isEmpty { UnexpectedFloatBanner(m: m) }
                     if !m.misplaced.isEmpty { MisplacedBanner(m: m) }
                     ForEach(grouped, id: \.0) { ws, wins in
                         // Name dazu, wenn einer in workspaces.conf steht —
@@ -1610,6 +1694,54 @@ struct OrphanBanner: View {
         }
         .padding(10)
         .background(Color.orange.opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .padding(.horizontal, 10).padding(.top, 8)
+    }
+}
+
+/// Hinweis auf Fenster, die floaten, ohne dass eine Regel es verlangt.
+/// Gelb: zwischen Unordnung (blau) und Defekt (orange) — es funktioniert
+/// alles, aber das Fenster steht nicht im Kachelbaum und reagiert
+/// deshalb auf keinen Layout-Befehl.
+struct UnexpectedFloatBanner: View {
+    @ObservedObject var m: Model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "rectangle.dashed")
+                    .foregroundStyle(.yellow)
+                Text(m.unexpectedFloats.count == 1
+                     ? "1 Fenster floatet ohne Regel"
+                     : "\(m.unexpectedFloats.count) Fenster floaten ohne Regel")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Button("alle kacheln") { m.fixUnexpectedFloats() }
+                    .buttonStyle(.borderedProminent).controlSize(.small)
+            }
+            Text("Ein floatendes Fenster steht nicht im Kachelbaum: es lässt sich "
+                 + "nicht stapeln oder tauschen, und relayout legt es nicht ins "
+                 + "Raster. Passiert nach Änderungen an der Displayanordnung und "
+                 + "bei versehentlichem ⌥⇧F.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            ForEach(m.unexpectedFloats) { f in
+                HStack(spacing: 8) {
+                    Text(f.appName).font(.system(size: 12, weight: .medium))
+                    Text("Workspace \(f.workspace)")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("kacheln") {
+                        Aero.run(["layout", "tiling", "--window-id", String(f.windowId)])
+                        m.refresh()
+                    }
+                    .buttonStyle(.link).font(.caption)
+                }
+            }
+        }
+        .padding(10)
+        .background(Color.yellow.opacity(0.12))
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .padding(.horizontal, 10).padding(.top, 8)
     }
